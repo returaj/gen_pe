@@ -111,3 +111,50 @@ class EnsembleValue(nnx.Module):
 
     def __call__(self, x):
         return self.v1(x), self.v2(x)
+
+
+def mh_sampling(key, model, obs, init_act, beta=1.0, num_itr=10, clip_range=(-0.9, 0.9)):
+    u_min, u_max = clip_range
+    
+    def sample(i, carry):
+        key, u = carry
+        key, subkey1, subkey2 = jax.random.split(key, 3)
+        # sample new action
+        u_new = u + 0.3*jax.random.normal(subkey1, shape=u.shape, dtype=u.dtype)
+        u_new = jnp.clip(u_new, min=u_min, max=u_max)
+        # estimate adv
+        adv = jnp.exp((model(obs, u_new) - model(obs, u)) / beta)
+        adv = jnp.minimum(1.0, adv)
+        # sample action wrt adv
+        rand = jax.random.uniform(subkey2, shape=adv.shape)
+        u = jnp.where(rand < adv, u_new, u)
+        return (key, u)
+    
+    init_carry = (key, init_act)
+    (_, u) = jax.lax.fori_loop(0, num_itr, sample, init_carry)
+    return u
+
+
+class MHPolicy(nnx.Module):
+    def __init__(self, rngs, obs_dim, act_dim, beta, hidden_size=256):
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.beta = beta
+        self._pref_model = TdmpcValue(rngs, obs_dim + act_dim, hidden_size)
+
+    def h(self, obs, act):
+        return self._pref_model(jnp.concatenate([obs, act], axis=-1))
+
+    def action(self, key, obs, init_act, num_itr=10):
+        return mh_sampling(
+            key=key,
+            model=self._pref_model,
+            obs=obs,
+            init_act=init_act,
+            beta=self.beta,
+            num_itr=num_itr
+        )
+
+    def __call__(self, obs, init_act, key):
+        return self.action(key, obs, init_act)
+ 

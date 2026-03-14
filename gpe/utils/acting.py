@@ -29,7 +29,7 @@ def actor_step(
     extra_fields: Sequence[str] = (),
 ) -> Tuple[types.EnvState, types.Transition]:
     """Collect data."""
-    actions, policy_extras = policy(env_state.obs, key)
+    actions, policy_extras = policy(env_state.obs, key) # add initial action info
     nstate = env.step(env_state, actions)
     state_extras = {x: nstate.info[x] for x in extra_fields}
     return nstate, types.Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray

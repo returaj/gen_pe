@@ -15,7 +15,6 @@
 
 from typing import Any, Mapping, NamedTuple, Tuple, TypeVar, Union
 
-from brax.training.acme.types import NestedArray
 import flax
 import jax
 import jax.numpy as jnp
@@ -28,6 +27,9 @@ try:
   from typing import Protocol  # pylint:disable=g-import-not-at-top
 except ImportError:
   from typing_extensions import Protocol  # pylint:disable=g-import-not-at-top
+
+
+NestedArray = jnp.ndarray
 
 Env = Any
 EnvState = Any
@@ -61,6 +63,7 @@ class Policy(Protocol):
   def __call__(
       self,
       observation: Observation,
+      init_action: Action,
       key: PRNGKey,
   ) -> Tuple[Action, Extra]:
     pass
