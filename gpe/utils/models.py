@@ -104,7 +104,7 @@ class PreferencePolicy(nnx.Module):
 
 
 class MHPolicy(PreferencePolicy):
-    def mh_sampling(self, obs, init_act, key, sigma=1.0, decay=0.9, num_itr=10):
+    def mh_sampling(self, obs, init_act, key, sigma=1.0, decay=0.9, num_itr=20):
         # obs:  B X obs_dim
         # init_act: B X act_dim
 

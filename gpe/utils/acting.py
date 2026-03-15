@@ -63,20 +63,20 @@ def actor_step(
     """Collect data."""
 
     init_action = env_state.info["init_action"]
-    action, policy_extras = policy(
+    action, _ = policy(
         env_state.obs, init_action, key
     )  # add initial action info
     n_env_state = env.step(env_state, action)
-    state_extras = {x: n_env_state.info[x].squeeze() for x in extra_fields}
+    state_extras = {x: n_env_state.info[x] for x in extra_fields}
     return (
         n_env_state,
         types.Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray
-            observation=env_state.obs.squeeze(),
-            action=action.squeeze(),
-            reward=n_env_state.reward.squeeze(),
-            discount=1 - n_env_state.done.squeeze(),
-            next_observation=n_env_state.obs.squeeze(),
-            extras={"policy_extras": {}, "state_extras": state_extras},
+            observation=env_state.obs,
+            action=action,
+            reward=n_env_state.reward,
+            discount=1 - n_env_state.done,
+            next_observation=n_env_state.obs,
+            extras={"state_extras": state_extras},
         ),
     )
 

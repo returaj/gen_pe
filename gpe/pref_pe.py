@@ -23,7 +23,7 @@ from gpe.utils.models import EnsembleValue, MHPolicy, get_tree_norm
 from gpe.utils.types import Transition
 from gpe.utils.utils import make_static_config_from_dict, single_agent_args
 
-jax.config.update("jax_disable_jit", True)
+# jax.config.update("jax_disable_jit", True)
 EPS = 1e-6
 
 default_cfg = {
@@ -31,13 +31,13 @@ default_cfg = {
     "save_freq": int(2e4),
     "eval_episode_freq": 1,  # use saved bc_policy to run evaluatation
     "hidden_size": 256,
-    "max_grad_norm": 5.0,
+    "max_grad_norm": 10.0,
     "gamma": 0.99,
     "update_tau": 0.005,
     "weight_decay": 0.01,
     "episode_length": 1000,
-    "warmup_samples": int(10),
-    "max_replay_size": int(1e5),
+    "warmup_samples": int(1e4),
+    "max_replay_size": int(1e6),
     "total_iteration": int(1e6),
 }
 
@@ -67,7 +67,6 @@ def discounted_sum(arr, gamma):
     return cumsum
 
 
-@functools.partial(nnx.jit, static_argnames="buffer")
 def prefill_buffer(
     key,
     env,
@@ -75,7 +74,7 @@ def prefill_buffer(
     buffer_state,
     policy,
     buffer,
-    num_itr=1000,
+    num_itr,
 ):
     def body(carry, unused):
         key, env_state, buffer_state = carry
@@ -90,8 +89,9 @@ def prefill_buffer(
         )
         return (key, env_state, buffer_state), ()
 
+    jitted_body = jax.jit(body)
     (_, env_state, buffer_state), () = jax.lax.scan(
-        body,
+        jitted_body,
         (key, env_state, buffer_state),
         (),
         length=num_itr,
@@ -118,165 +118,75 @@ def get_experience(
     return env_state, buffer_state
 
 
-def compute_target_value(cost_model, bc_policy, value_model, obs, act, done, gamma):
-    dtype = obs.dtype
-
-    # Batch X Horizon X obs_dim
-    batch, horizon, _ = obs.shape
-
-    # Batch X Horizon X act_dim
-    act_next, *_ = bc_policy(obs.reshape(batch * horizon, -1))
-    act_next = act_next.reshape(batch, horizon, -1)
-
-    # mask last horizon
-    mask_last_horizon = jnp.concat(
-        [jnp.ones(horizon - 1, dtype=dtype), jnp.zeros(1, dtype=dtype)]
-    )
-    # This is a permutation matrix to shift one timestep ahead
-    shift_one_timestep = jnp.eye(horizon, k=-1, dtype=dtype)
-
-    def batch_fun(obs, act, act_next, done):
-        # Batch X Horizon
-        _, cost = cost_model(jnp.concat([obs, act], axis=-1))
-        cost = mask_last_horizon * cost
-        # Batch X Horizon
-        v_next = jnp.maximum(*value_model(jnp.concat([obs, act_next], axis=-1)))
-        v_next = v_next @ shift_one_timestep
-
-        target = cost + gamma * (1 - done) * v_next
-        return target
-
-    target_value = jax.vmap(batch_fun, in_axes=(0, 0, 0, 0))(obs, act, act_next, done)
-    return target_value
-
-
 def value_loss_grad_fun(
     target_value_model,
     value_model,
     policy_model,
     data,
     gamma,
+    key,
 ):
-    print(data.observation.shape)
-    raise Exception
-    dtype = data.union_obs.dtype
-    horizon = data.horizon
+    batch, num_env, obs_dim = data.observation.shape
+    batch, num_env, act_dim = data.action.shape
 
-    # mask the horizon-1 element
-    mask = jnp.concat([jnp.ones(horizon - 1, dtype=dtype), jnp.zeros(1, dtype=dtype)])
+    # Batch X obs/act/()_dim
+    obs = data.observation.reshape(batch * num_env, obs_dim)
+    act = data.action.reshape(batch * num_env, act_dim)
+    next_obs = data.next_observation.reshape(batch * num_env, obs_dim)
+    reward = data.reward.reshape(batch * num_env)
+    done = data.discount.reshape(batch * num_env)
 
     # Batch X Horizon
-    target_v = compute_target_value(
-        cost_model=cost_model,
-        bc_policy=bc_policy,
-        value_model=target_value_model,
-        obs=data.union_obs,
-        act=data.union_act,
-        done=data.union_done,
-        gamma=gamma,
-    )
+    next_act, _ = policy_model(next_obs, act, key)
+    next_q = jnp.minimum(*target_value_model(jnp.concat([next_obs, next_act], axis=-1)))   
+    target_v = reward + gamma * done * next_q
 
     def loss_fun(value_model):
         # Batch X Horizon X obs_act_dim
-        target_oa = jnp.concat([data.union_obs, data.union_act], axis=-1)
+        target_oa = jnp.concat([obs, act], axis=-1)
         # Batch X Horizon
         pred_v1, pred_v2 = value_model(target_oa)
-        v1_loss = mask * optax.huber_loss(pred_v1, target_v, delta=2.0)
-        v2_loss = mask * optax.huber_loss(pred_v2, target_v, delta=2.0)
-        discounted_v1_loss = discounted_sum(v1_loss.T, gamma)
-        discounted_v2_loss = discounted_sum(v2_loss.T, gamma)
-
-        loss = jnp.mean(discounted_v1_loss) + jnp.mean(discounted_v2_loss)
+        v1_loss = optax.huber_loss(pred_v1, target_v, delta=2.0)
+        v2_loss = optax.huber_loss(pred_v2, target_v, delta=2.0)
+        loss = jnp.mean(v1_loss) + jnp.mean(v2_loss)
         return loss
 
     grad_fun = nnx.value_and_grad(loss_fun)
     loss, grads = grad_fun(value_model)
-    grads = jax.tree.map(lambda g: g / horizon, grads)
 
     return loss, grads
 
 
-def compute_value_weight(
-    value_model,
-    bc_policy,
-    obs,
-    act,
-    alpha,
-    beta,
-    use_osil_weight,
-):
-    pred_act, *_ = bc_policy(obs)
-
-    # Batch_Horizon
-    q = jnp.maximum(*value_model(jnp.concat([obs, act], axis=-1)))
-    v = jnp.maximum(*value_model(jnp.concat([obs, pred_act], axis=-1)))
-
-    def per_transition_weight():
-        neg_adv = jnp.clip(-(q - v) / beta, max=2.0)
-        union_weight = jnp.exp(neg_adv) / jnp.mean(jnp.abs(v))
-        return union_weight
-
-    def constant_adaptive_weight():
-        # osil type union weight
-        neg_adv = -(q - v) / beta
-        log_Z = jax.nn.logsumexp(neg_adv) - jnp.log(neg_adv.shape[0]) + EPS
-        union_weight = alpha * jnp.exp(jnp.clip(log_Z, max=5.0))
-        return union_weight
-
-    union_weight = jnp.where(
-        use_osil_weight, constant_adaptive_weight(), per_transition_weight()
-    )
-    return union_weight, jnp.abs(q).mean(), jnp.abs(v).mean()
-
-
 def policy_loss_grad_fun(
     value_model,
-    bc_policy,
+    policy_model,
     data,
     config,
-    has_positive,
+    key,
 ):
-    # Batch X Horizon X obs_dim
-    batch, horizon, _ = data.union_obs.shape
+    batch, num_env, obs_dim = data.observation.shape
+    batch, num_env, act_dim = data.action.shape
 
-    # Batch_Horizon X obs/act_dim
-    target_pos_obs = data.pos_obs.reshape(batch * horizon, -1)
-    target_pos_act = data.pos_act.reshape(batch * horizon, -1)
+    # Batch X obs/act/()_dim
+    obs = data.observation.reshape(batch * num_env, obs_dim)
+    act = data.action.reshape(batch * num_env, act_dim)
+    pi_act, _ = policy_model(obs, act, key)
 
-    target_union_obs = data.union_obs.reshape(batch * horizon, -1)
-    target_union_act = data.union_act.reshape(batch * horizon, -1)
+    q = jnp.minimum(*value_model(jnp.concat([obs, act], axis=-1)))
+    v = jnp.minimum(*value_model(jnp.concat([obs, pi_act], axis=-1)))
+    adv = q - v
 
-    union_weight, qmean, vmean = compute_value_weight(
-        value_model=value_model,
-        bc_policy=bc_policy,
-        obs=target_union_obs,
-        act=target_union_act,
-        alpha=config.alpha,
-        beta=config.beta,
-        use_osil_weight=config.use_osil_weight,
-    )
-
-    def loss_fun(bc_policy):
-        pred_pos_act, *_ = bc_policy(target_pos_obs)
-        pos_loss = optax.l2_loss(pred_pos_act, target_pos_act).sum(axis=-1)
-        pos_bc_loss = has_positive * jnp.mean(pos_loss)
-
-        pred_union_act, *_ = bc_policy(target_union_obs)
-        union_loss = optax.l2_loss(pred_union_act, target_union_act).sum(axis=-1)
-        union_bc_loss = jnp.mean(union_loss)
-
-        union_value = jnp.maximum(
-            *value_model(jnp.concat([target_union_obs, pred_union_act], axis=-1))
-        )
-        union_value_loss = jnp.mean(union_weight * union_value)
-
-        loss = pos_bc_loss + union_bc_loss + union_value_loss
-        return loss, (pos_bc_loss, union_bc_loss, union_value_loss)
+    def loss_fun(policy_model):
+        h = policy_model.h(obs, act)
+        hpi = policy_model.h(obs, pi_act)
+        pg_loss = jnp.mean(adv * (h - hpi))
+        reg_loss = config.lmbda * jnp.mean(h**2 + hpi**2)
+        return pg_loss + reg_loss, (pg_loss, reg_loss)
 
     grad_fun = nnx.value_and_grad(loss_fun, has_aux=True)
-    (loss, aux_values), grads = grad_fun(bc_policy)
+    (loss, aux_values), grads = grad_fun(policy_model)
 
-    return loss, grads, *aux_values, qmean, vmean
+    return loss, grads, *aux_values, q.mean(), v.mean()
 
 
 def train_step(
@@ -287,14 +197,18 @@ def train_step(
     policy_optimizer,
     batch_data,
     config,
+    key,
     steps,
 ):
-    value_loss, value_grads, *value_aux = value_loss_grad_fun(
+    value_key, policy_key = jax.random.split(key)
+
+    value_loss, value_grads = value_loss_grad_fun(
         target_value_model=value_model_target,
         value_model=value_model,
         policy_model=policy_model,
         data=batch_data,
         gamma=config.gamma,
+        key=value_key,
     )
     value_optimizer.update(value_grads)
 
@@ -303,6 +217,7 @@ def train_step(
         policy_model=policy_model,
         data=batch_data,
         config=config,
+        key=policy_key,
     )
     policy_optimizer.update(policy_grads)
 
@@ -312,13 +227,12 @@ def train_step(
 
     return (
         value_loss,
-        *value_aux,
         policy_loss,
         *policy_aux,
     )
 
 
-@functools.partial(nnx.jit, static_argnames="buffer")
+@functools.partial(nnx.jit, static_argnames=("env", "buffer"))
 def train_n_steps(
     env,
     env_state,
@@ -347,10 +261,10 @@ def train_n_steps(
             policy_optimizer,
         ) = carry
 
-        key, subkey = jax.random.split(key)
+        key, buffer_key, train_key = jax.random.split(key, 3)
 
         env_state, buffer_state = get_experience(
-            key=subkey,
+            key=buffer_key,
             env=env,
             env_state=env_state,
             buffer_state=buffer_state,
@@ -368,6 +282,7 @@ def train_n_steps(
             policy_optimizer=policy_optimizer,
             batch_data=batch_data,
             config=config,
+            key=train_key,
             steps=i,
         )
 
@@ -383,7 +298,7 @@ def train_n_steps(
             policy_optimizer,
         )
 
-    init_val = (jnp.zeros((), dtype=jnp.float32),) * 19
+    init_val = (jnp.zeros((), dtype=jnp.float32),) * 6
     init_carry = (
         init_val,
         key,
@@ -430,8 +345,8 @@ def main(args, cfg_env=None):
 
     config_data = make_static_config_from_dict(name="State", d=config)()
 
-    # environment
-    prng_key, env_key = jax.random.split(prng_key)
+    # training environment
+    prng_key, env_key, eval_env_key = jax.random.split(prng_key, 3)
     env_key = jax.random.split(env_key, 1)
     env = acting.wrap_env_for_training(
         env=registry.load(args.task),
@@ -474,15 +389,28 @@ def main(args, cfg_env=None):
     )
     value_model_target = deepcopy(value_model)
 
-    dummy_obs = jnp.zeros((obs_dim,))
-    dummy_action = jnp.zeros((act_dim,))
+    # eval environment
+    eval_env_key = jax.random.split(eval_env_key, 1)
+    eval_env_state = env.reset(eval_env_key)
+    evaluate_fun = functools.partial(
+        acting.generate_unroll,
+        env=env, 
+        policy=policy_model, 
+        unroll_length=1000, 
+        extra_fields=("truncation",),
+    )
+    evaluate_fun_jit = jax.jit(evaluate_fun)
+
+    dummy_obs = jnp.zeros((1, obs_dim))
+    dummy_action = jnp.zeros((1, act_dim))
+    dummy_zero = jnp.zeros((1,))
     dummy_transition = Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray
         observation=dummy_obs,
         action=dummy_action,
-        reward=0.0,
-        discount=0.0,
+        reward=dummy_zero,
+        discount=dummy_zero,
         next_observation=dummy_obs,
-        extras={"state_extras": {"truncation": 0.0}, "policy_extras": {}},
+        extras={"state_extras": {"truncation": dummy_zero}, },
     )
 
     buffer = UniformSamplingQueue(
@@ -512,7 +440,7 @@ def main(args, cfg_env=None):
         num_itr=config["warmup_samples"],
     )
 
-    logger.log("")
+    logger.log("Start training value and policy model")
     steps = buffer.size(buffer_state)
     while steps < config["total_iteration"]:
         prng_key, subkey = jax.random.split(prng_key)
@@ -532,25 +460,12 @@ def main(args, cfg_env=None):
         )
 
         (
-            cost_loss,
-            pos_neg_pref_loss,
-            pos_union_pref_loss,
-            union_neg_pref_loss,
-            pref_loss,
-            contrastive_loss,
             value_loss,
             policy_loss,
-            policy_pos_bc_loss,
-            policy_union_bc_loss,
-            policy_union_value_loss,
+            policy_pg_loss,
+            policy_reg_loss,
             policy_qmean,
             policy_vmean,
-            mean_pos_reward,
-            mean_neg_reward,
-            mean_union_reward,
-            mean_pos_cost,
-            mean_neg_cost,
-            mean_union_cost,
         ) = val
 
         steps += num_itr
@@ -558,38 +473,16 @@ def main(args, cfg_env=None):
         logger.logged = False
 
         if (steps % config["log_freq"] == 0) and (not logger.logged):
-
             logger.log_tabular("Train/Steps", steps)
-
-            logger.log_tabular("Loss/Loss_cost", cost_loss.item())
-            logger.log_tabular("Loss/Loss_pos_neg_pref_cost", pos_neg_pref_loss.item())
-            logger.log_tabular(
-                "Loss/Loss_pos_union_pref_cost", pos_union_pref_loss.item()
-            )
-            logger.log_tabular(
-                "Loss/Loss_union_neg_pref_cost", union_neg_pref_loss.item()
-            )
-            logger.log_tabular("Loss/Loss_pref_cost", pref_loss.item())
-            logger.log_tabular("Loss/Loss_contrastive_cost", contrastive_loss.item())
 
             logger.log_tabular("Loss/Loss_value", value_loss.item())
 
             logger.log_tabular("Loss/Loss_policy", policy_loss.item())
-            logger.log_tabular("Loss/Loss_policy_pos_bc", policy_pos_bc_loss.item())
-            logger.log_tabular("Loss/Loss_policy_union_bc", policy_union_bc_loss.item())
-            logger.log_tabular(
-                "Loss/Loss_policy_union_value", policy_union_value_loss.item()
-            )
+            logger.log_tabular("Loss/Loss_policy_pg", policy_pg_loss.item())
+            logger.log_tabular("Loss/Loss_policy_reg", policy_reg_loss.item())
+            
             logger.log_tabular("Loss/policy_q_value", policy_qmean.item())
             logger.log_tabular("Loss/policy_v_value", policy_vmean.item())
-
-            logger.log_tabular("Reward/pos", mean_pos_reward.item())
-            logger.log_tabular("Reward/neg", mean_neg_reward.item())
-            logger.log_tabular("Reward/union", mean_union_reward.item())
-
-            logger.log_tabular("Cost/pos", mean_pos_cost.item())
-            logger.log_tabular("Cost/neg", mean_neg_cost.item())
-            logger.log_tabular("Cost/union", mean_union_cost.item())
 
             logger.log_tabular(
                 "Norm/value_model",
@@ -599,6 +492,14 @@ def main(args, cfg_env=None):
                 "Norm/policy_model",
                 get_tree_norm(nnx.state(policy_model, nnx.Param)),
             )
+
+            if args.use_eval:
+                prng_key, eval_env_key = jax.random.split(prng_key)
+                eval_env_state, transition_data = evaluate_fun_jit(
+                    env_state=eval_env_state, key=eval_env_key
+                )
+                logger.log_tabular("Eval/Return", transition_data.reward.sum())
+
             logger.dump_tabular()
 
         if steps % config["save_freq"] == 0:
