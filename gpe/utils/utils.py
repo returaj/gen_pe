@@ -107,6 +107,24 @@ def single_agent_args():
             "help": "hyperparameter lambda value",
         },
         {
+            "name": "--alpha",
+            "type": float,
+            "default": None,  # 1e-3 performs better
+            "help": "hyperparameter lambda value",
+        },
+        {
+            "name": "--beta",
+            "type": float,
+            "default": None,  # 1e-3 performs better
+            "help": "hyperparameter lambda value",
+        },
+        {
+            "name": "--policy-type",
+            "type": str,
+            "default": "mh_sampling",
+            "help": "use different sampling method",
+        },
+        {
             "name": "--normalize-observation",
             "type": lambda x: bool(strtobool(x)),
             "default": False,

@@ -16,9 +16,41 @@
 from typing import Sequence, Tuple
 
 import jax
-import numpy as np
+import jax.numpy as jnp
+from mujoco_playground import wrapper
 
 from gpe.utils import types
+
+
+class WrapPrevAction(wrapper.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self._name = "init_action"
+
+    def reset(self, rng: jnp.ndarray):
+        batch = rng.shape[0]
+        state = self.env.reset(rng)
+        state.info[self._name] = jnp.zeros(
+            shape=(batch, self.action_size), dtype=jnp.float32
+        )
+        return state
+
+    def step(self, state: types.EnvState, action: types.Action):
+        reset_init_action = jnp.zeros_like(state.info[self._name])
+        batch = reset_init_action.shape[0]
+        done = jnp.reshape(state.done, (batch, 1))
+        init_action = jnp.where(done, reset_init_action, action)
+
+        nstate = self.env.step(state, action)
+        nstate.info[self._name] = init_action
+        return nstate
+
+
+def wrap_env_for_training(env, episode_length, action_repeat=1):
+    env = wrapper.wrap_for_brax_training(
+        env=env, episode_length=episode_length, action_repeat=action_repeat
+    )
+    return WrapPrevAction(env)
 
 
 def actor_step(
@@ -29,16 +61,23 @@ def actor_step(
     extra_fields: Sequence[str] = (),
 ) -> Tuple[types.EnvState, types.Transition]:
     """Collect data."""
-    actions, policy_extras = policy(env_state.obs, key) # add initial action info
-    nstate = env.step(env_state, actions)
-    state_extras = {x: nstate.info[x] for x in extra_fields}
-    return nstate, types.Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray
-        observation=env_state.obs,
-        action=actions,
-        reward=nstate.reward,
-        discount=1 - nstate.done,
-        next_observation=nstate.obs,
-        extras={"policy_extras": policy_extras, "state_extras": state_extras},
+
+    init_action = env_state.info["init_action"]
+    action, policy_extras = policy(
+        env_state.obs, init_action, key
+    )  # add initial action info
+    n_env_state = env.step(env_state, action)
+    state_extras = {x: n_env_state.info[x].squeeze() for x in extra_fields}
+    return (
+        n_env_state,
+        types.Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray
+            observation=env_state.obs.squeeze(),
+            action=action.squeeze(),
+            reward=n_env_state.reward.squeeze(),
+            discount=1 - n_env_state.done.squeeze(),
+            next_observation=n_env_state.obs.squeeze(),
+            extras={"policy_extras": {}, "state_extras": state_extras},
+        ),
     )
 
 
@@ -53,12 +92,16 @@ def generate_unroll(
     """Collect trajectories of given unroll_length."""
 
     def f(carry, unused_t):
-        state, current_key = carry
+        env_state, current_key = carry
         current_key, next_key = jax.random.split(current_key)
-        nstate, transition = actor_step(
-            env, state, policy, current_key, extra_fields=extra_fields
+        n_env_state, n_transition = actor_step(
+            env=env,
+            env_state=env_state,
+            policy=policy,
+            key=current_key,
+            extra_fields=extra_fields,
         )
-        return (nstate, next_key), transition
+        return (n_env_state, next_key), n_transition
 
     f_jit = jax.jit(f, donate_argnums=(0,))
     (final_state, _), data = jax.lax.scan(

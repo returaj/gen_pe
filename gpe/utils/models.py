@@ -49,42 +49,6 @@ class Scalar(nnx.Module):
         return self.val
 
 
-class ExpCostModel(nnx.Module):
-    def __init__(self, rngs, x_dims, hidden_size=256, clip_range=(0.0, 1.0)):
-        sizes = [x_dims, hidden_size, hidden_size, 1]
-        layers = list()
-        for j in range(len(sizes) - 1):
-            act = nnx.elu if j < len(sizes) - 2 else jax.nn.identity
-            affine_layer = nnx.Linear(sizes[j], sizes[j + 1], rngs=rngs)
-            layers += [affine_layer, act]
-        self.model = nnx.Sequential(*layers)
-        self.min, self.max = clip_range
-
-    def __call__(self, x):
-        x = jnp.squeeze(self.model(x), axis=-1)
-        ret = jax.nn.sigmoid(x)
-        ret = jnp.clip(ret, min=self.min, max=self.max)
-        return ret
-
-
-class ContrastiveCostModel(nnx.Module):
-    def __init__(self, rngs, x_dims, hidden_size=256):
-        sizes = [x_dims, hidden_size, hidden_size, 128]
-        layers = list()
-        for j in range(len(sizes) - 1):
-            act = nnx.elu if j < len(sizes) - 2 else jax.nn.identity
-            affine_layer = nnx.Linear(sizes[j], sizes[j + 1], rngs=rngs)
-            layers += [affine_layer, act]
-        self.encoder = nnx.Sequential(*layers)
-        self.projection = nnx.Linear(sizes[-1], 1, rngs=rngs)
-
-    def __call__(self, x):
-        z = l2_normalize(self.encoder(x), axis=-1)
-        proj_z = jnp.squeeze(self.projection(z), axis=-1)
-        cost = jax.nn.sigmoid(proj_z)
-        return z, cost
-
-
 class TdmpcValue(nnx.Module):
     def __init__(self, rngs, x_dim, hidden_size=256):
         zero_init = nnx.initializers.zeros
@@ -113,48 +77,57 @@ class EnsembleValue(nnx.Module):
         return self.v1(x), self.v2(x)
 
 
-def mh_sampling(key, model, obs, init_act, beta=1.0, num_itr=10, clip_range=(-0.9, 0.9)):
-    u_min, u_max = clip_range
-    
-    def sample(i, carry):
-        key, u = carry
-        key, subkey1, subkey2 = jax.random.split(key, 3)
-        # sample new action
-        u_new = u + 0.3*jax.random.normal(subkey1, shape=u.shape, dtype=u.dtype)
-        u_new = jnp.clip(u_new, min=u_min, max=u_max)
-        # estimate adv
-        adv = jnp.exp((model(obs, u_new) - model(obs, u)) / beta)
-        adv = jnp.minimum(1.0, adv)
-        # sample action wrt adv
-        rand = jax.random.uniform(subkey2, shape=adv.shape)
-        u = jnp.where(rand < adv, u_new, u)
-        return (key, u)
-    
-    init_carry = (key, init_act)
-    (_, u) = jax.lax.fori_loop(0, num_itr, sample, init_carry)
-    return u
-
-
-class MHPolicy(nnx.Module):
-    def __init__(self, rngs, obs_dim, act_dim, beta, hidden_size=256):
+class PreferencePolicy(nnx.Module):
+    def __init__(
+        self,
+        rngs,
+        obs_dim,
+        act_dim,
+        beta=1.0,
+        hidden_size=256,
+        clip_range=(-0.9, 0.9),
+    ):
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.beta = beta
+        self.clip_range = clip_range
         self._pref_model = TdmpcValue(rngs, obs_dim + act_dim, hidden_size)
 
     def h(self, obs, act):
         return self._pref_model(jnp.concatenate([obs, act], axis=-1))
 
-    def action(self, key, obs, init_act, num_itr=10):
-        return mh_sampling(
-            key=key,
-            model=self._pref_model,
-            obs=obs,
-            init_act=init_act,
-            beta=self.beta,
-            num_itr=num_itr
-        )
+    def sampling(self, obs, init_act, key, **kwargs):
+        raise Exception("Please implement sampling strategy.")
 
-    def __call__(self, obs, init_act, key):
-        return self.action(key, obs, init_act)
- 
+    def __call__(self, obs, init_act, key, **kwargs):
+        return self.sampling(obs, init_act, key, **kwargs)
+
+
+class MHPolicy(PreferencePolicy):
+    def mh_sampling(self, obs, init_act, key, sigma=1.0, decay=0.9, num_itr=10):
+        # obs:  B X obs_dim
+        # init_act: B X act_dim
+
+        u_min, u_max = self.clip_range
+
+        def body(i, carry):
+            u, sigma, key = carry
+            key, subkey1, subkey2 = jax.random.split(key, 3)
+            # sample new action
+            u_new = u + sigma * jax.random.normal(subkey1, shape=u.shape, dtype=u.dtype)
+            u_new = jnp.clip(u_new, min=u_min, max=u_max)
+            # estimate adv
+            adv = jnp.exp((self.h(obs, u_new) - self.h(obs, u)) / self.beta)
+            adv = jnp.minimum(1.0, adv)
+            # sample action wrt adv
+            rand = jax.random.uniform(subkey2, shape=adv.shape)
+            select = (rand < adv).reshape(u.shape[0], 1)
+            u = jnp.where(select, u_new, u)
+            return (u, decay * sigma, key)
+
+        init_carry = (init_act, sigma, key)
+        (u, sigma, _) = nnx.fori_loop(0, num_itr, body, init_carry)
+        return u, sigma
+
+    def sampling(self, obs, init_act, key, **kwargs):
+        return self.mh_sampling(obs, init_act, key, **kwargs)

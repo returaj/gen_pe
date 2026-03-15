@@ -8,26 +8,22 @@ import time
 from collections import deque
 from copy import deepcopy
 
-import dsrl.infos as dsrl_infos
-import dsrl.offline_safety_gymnasium  # type: ignore
-import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import nnx
 from jax import debug
+from mujoco_playground import registry
 
+from gpe.utils import acting
 from gpe.utils.buffer import UniformSamplingQueue
-from gpe.utils.models import (
-    EnsembleValue,
-    TdmpcValue,
-    get_tree_norm,
-)
 from gpe.utils.logger import EpochLogger
+from gpe.utils.models import EnsembleValue, MHPolicy, get_tree_norm
+from gpe.utils.types import Transition
 from gpe.utils.utils import make_static_config_from_dict, single_agent_args
 
-# jax.config.update("jax_disable_jit", True)
+jax.config.update("jax_disable_jit", True)
 EPS = 1e-6
 
 default_cfg = {
@@ -39,6 +35,9 @@ default_cfg = {
     "gamma": 0.99,
     "update_tau": 0.005,
     "weight_decay": 0.01,
+    "episode_length": 1000,
+    "warmup_samples": int(10),
+    "max_replay_size": int(1e5),
     "total_iteration": int(1e6),
 }
 
@@ -66,6 +65,57 @@ def discounted_sum(arr, gamma):
     init_cumsum = jnp.zeros_like(arr[0], dtype=dtype)
     cumsum = jax.lax.fori_loop(0, horizon, body_fun, init_cumsum)
     return cumsum
+
+
+@functools.partial(nnx.jit, static_argnames="buffer")
+def prefill_buffer(
+    key,
+    env,
+    env_state,
+    buffer_state,
+    policy,
+    buffer,
+    num_itr=1000,
+):
+    def body(carry, unused):
+        key, env_state, buffer_state = carry
+        key, subkey = jax.random.split(key)
+        env_state, buffer_state = get_experience(
+            key=subkey,
+            env=env,
+            env_state=env_state,
+            buffer_state=buffer_state,
+            policy=policy,
+            buffer=buffer,
+        )
+        return (key, env_state, buffer_state), ()
+
+    (_, env_state, buffer_state), () = jax.lax.scan(
+        body,
+        (key, env_state, buffer_state),
+        (),
+        length=num_itr,
+    )
+    return env_state, buffer_state
+
+
+def get_experience(
+    key,
+    env,
+    env_state,
+    buffer_state,
+    policy,
+    buffer,
+):
+    env_state, n_transition = acting.actor_step(
+        env=env,
+        env_state=env_state,
+        policy=policy,
+        key=key,
+        extra_fields=("truncation",),
+    )
+    buffer_state = buffer.insert(buffer_state, n_transition)
+    return env_state, buffer_state
 
 
 def compute_target_value(cost_model, bc_policy, value_model, obs, act, done, gamma):
@@ -101,13 +151,14 @@ def compute_target_value(cost_model, bc_policy, value_model, obs, act, done, gam
 
 
 def value_loss_grad_fun(
-    cost_model,
-    bc_policy,
     target_value_model,
     value_model,
+    policy_model,
     data,
     gamma,
 ):
+    print(data.observation.shape)
+    raise Exception
     dtype = data.union_obs.dtype
     horizon = data.horizon
 
@@ -229,162 +280,120 @@ def policy_loss_grad_fun(
 
 
 def train_step(
-    cost_model,
-    cost_optimizer,
     value_model_target,
     value_model,
     value_optimizer,
-    bc_policy_target,
-    bc_policy,
-    bc_optimizer,
+    policy_model,
+    policy_optimizer,
     batch_data,
     config,
-    has_positive,
     steps,
 ):
-    cost_cond = (steps % config.update_cost_freq) == 0
-    cost_loss, cost_grads, *cost_aux = cost_loss_grad_fun(
-        cost_model=cost_model,
-        data=batch_data,
-        has_positive=has_positive,
-        gamma=config.gamma,
-    )
-    cost_grads = jax.tree.map(
-        lambda g: jnp.where(cost_cond, g, jnp.zeros_like(g)),
-        cost_grads,
-    )
-    cost_optimizer.update(cost_grads)
-
-    value_loss, value_grads = value_loss_grad_fun(
-        cost_model=cost_model,
-        bc_policy=bc_policy_target,
+    value_loss, value_grads, *value_aux = value_loss_grad_fun(
         target_value_model=value_model_target,
         value_model=value_model,
+        policy_model=policy_model,
         data=batch_data,
         gamma=config.gamma,
     )
     value_optimizer.update(value_grads)
 
-    policy_cond = (steps % config.update_bc_freq) == 0
     policy_loss, policy_grads, *policy_aux = policy_loss_grad_fun(
         value_model=value_model,
-        bc_policy=bc_policy,
+        policy_model=policy_model,
         data=batch_data,
         config=config,
-        has_positive=has_positive,
     )
-    policy_grads = jax.tree.map(
-        lambda g: jnp.where(policy_cond, g, jnp.zeros_like(g)),
-        policy_grads,
-    )
-    bc_optimizer.update(policy_grads)
+    policy_optimizer.update(policy_grads)
 
     value_model_target = polyak_update(
-        value_model_target, value_model, policy_cond * config.update_tau
+        value_model_target, value_model, config.update_tau
     )
-    bc_policy_target = polyak_update(
-        bc_policy_target, bc_policy, policy_cond * config.update_tau
-    )
-
-    mean_pos_reward = batch_data.pos_reward.sum(-1).mean()
-    mean_neg_reward = batch_data.neg_reward.sum(-1).mean()
-    mean_union_reward = batch_data.union_reward.sum(-1).mean()
-
-    mean_pos_cost = batch_data.pos_cost.sum(-1).mean()
-    mean_neg_cost = batch_data.neg_cost.sum(-1).mean()
-    mean_union_cost = batch_data.union_cost.sum(-1).mean()
 
     return (
-        cost_loss,
-        *cost_aux,
         value_loss,
+        *value_aux,
         policy_loss,
         *policy_aux,
-        mean_pos_reward,
-        mean_neg_reward,
-        mean_union_reward,
-        mean_pos_cost,
-        mean_neg_cost,
-        mean_union_cost,
     )
 
 
-@nnx.jit
+@functools.partial(nnx.jit, static_argnames="buffer")
 def train_n_steps(
-    cost_model,
-    cost_optimizer,
+    env,
+    env_state,
+    buffer_state,
+    buffer,
     value_model_target,
     value_model,
     value_optimizer,
-    bc_policy_target,
-    bc_policy,
-    bc_optimizer,
-    data_buffer,
+    policy_model,
+    policy_optimizer,
     config,
-    has_positive,
     key,
 ):
     num_steps = config.log_freq
 
-    pos_idxs, neg_idxs, union_idxs = data_buffer.sample_idxs(
-        data_buffer, key, num_steps
-    )
-
     def body_fun(i, carry):
         (
             _,
-            cost_model,
-            cost_optimizer,
+            key,
+            env_state,
+            buffer_state,
             value_model_target,
             value_model,
             value_optimizer,
-            bc_policy_target,
-            bc_policy,
-            bc_optimizer,
+            policy_model,
+            policy_optimizer,
         ) = carry
 
-        batch_data = data_buffer.sample_batch(
-            data_buffer, pos_idxs[i], neg_idxs[i], union_idxs[i]
+        key, subkey = jax.random.split(key)
+
+        env_state, buffer_state = get_experience(
+            key=subkey,
+            env=env,
+            env_state=env_state,
+            buffer_state=buffer_state,
+            policy=policy_model,
+            buffer=buffer,
         )
 
+        buffer_state, batch_data = buffer.sample(buffer_state)
+
         val = train_step(
-            cost_model=cost_model,
-            cost_optimizer=cost_optimizer,
             value_model_target=value_model_target,
             value_model=value_model,
             value_optimizer=value_optimizer,
-            bc_policy_target=bc_policy_target,
-            bc_policy=bc_policy,
-            bc_optimizer=bc_optimizer,
+            policy_model=policy_model,
+            policy_optimizer=policy_optimizer,
             batch_data=batch_data,
             config=config,
-            has_positive=has_positive,
             steps=i,
         )
 
         return (
             val,
-            cost_model,
-            cost_optimizer,
+            key,
+            env_state,
+            buffer_state,
             value_model_target,
             value_model,
             value_optimizer,
-            bc_policy_target,
-            bc_policy,
-            bc_optimizer,
+            policy_model,
+            policy_optimizer,
         )
 
     init_val = (jnp.zeros((), dtype=jnp.float32),) * 19
     init_carry = (
         init_val,
-        cost_model,
-        cost_optimizer,
+        key,
+        env_state,
+        buffer_state,
         value_model_target,
         value_model,
         value_optimizer,
-        bc_policy_target,
-        bc_policy,
-        bc_optimizer,
+        policy_model,
+        policy_optimizer,
     )
     val, *_ = nnx.fori_loop(0, num_steps, body_fun, init_carry)
 
@@ -395,6 +404,8 @@ def main(args, cfg_env=None):
     # set the random seed, device and number of threads
     random.seed(args.seed)
     np.random.seed(args.seed)
+
+    prng_key = jax.random.PRNGKey(args.seed)
     rngs = nnx.Rngs(
         default=args.seed,
         params=args.seed + 3,
@@ -419,37 +430,26 @@ def main(args, cfg_env=None):
 
     config_data = make_static_config_from_dict(name="State", d=config)()
 
-    # evaluation environment
-    eval_env = gym.make(args.task)
-    eval_env.set_target_cost(config["target_cost"])
-    eval_env.reset(seed=args.seed)
+    # environment
+    prng_key, env_key = jax.random.split(prng_key)
+    env_key = jax.random.split(env_key, 1)
+    env = acting.wrap_env_for_training(
+        env=registry.load(args.task),
+        episode_length=config["episode_length"],
+    )
+    env_state = env.reset(env_key)
 
     # set model
-    obs_space, act_space = eval_env.observation_space, eval_env.action_space
-    bc_policy = SafeDiceTanhMixtureActor(
+    obs_dim, act_dim = env.observation_size, env.action_size
+    policy_model = MHPolicy(
         rngs=rngs,
-        obs_dim=obs_space.shape[0],
-        act_dim=act_space.shape[0],
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        beta=config["beta"],
         hidden_size=config["hidden_size"],
     )
-    bc_optimizer = nnx.Optimizer(
-        model=bc_policy,
-        tx=optax.chain(
-            optax.clip_by_global_norm(config["max_grad_norm"]),
-            optax.adamw(
-                learning_rate=config["lr"], weight_decay=config["weight_decay"]
-            ),
-        ),
-    )
-    bc_policy_target = deepcopy(bc_policy)
-
-    cost_model = ContrastiveCostModel(
-        rngs=rngs,
-        x_dims=obs_space.shape[0] + act_space.shape[0],
-        hidden_size=config["hidden_size"],
-    )
-    cost_optimizer = nnx.Optimizer(
-        model=cost_model,
+    policy_optimizer = nnx.Optimizer(
+        model=policy_model,
         tx=optax.chain(
             optax.clip_by_global_norm(config["max_grad_norm"]),
             optax.adamw(
@@ -460,7 +460,7 @@ def main(args, cfg_env=None):
 
     value_model = EnsembleValue(
         rngs=rngs,
-        x_dim=obs_space.shape[0] + act_space.shape[0],
+        x_dim=obs_dim + act_dim,
         hidden_size=config["hidden_size"],
     )
     value_optimizer = nnx.Optimizer(
@@ -474,103 +474,61 @@ def main(args, cfg_env=None):
     )
     value_model_target = deepcopy(value_model)
 
-    # data
-    agent_task = re.search(r"Offline(.*?)Gymnasium-v[0-9]", args.task).group(1)
-    ep_len = dsrl_infos.DEFAULT_MAX_EPISODE_STEPS[agent_task]
-    data = get_dataset_in_d4rl_format(
-        eval_env, trajectory_cfg, args.task, ep_len, config["action_repeat"]
-    )
-    pos_data, neg_data, union_data = get_pos_neg_and_union_data(data, trajectory_cfg)
-    mu_obs, std_obs = 0.0, 1.0
-    if config["normalize_observation"]:
-        pos_data, neg_data, union_data, mu_obs, std_obs = get_normalized_data(
-            pos_data, neg_data, union_data
-        )
-
-    neg_observations = neg_data["observations"]
-    neg_actions = neg_data["actions"]
-    neg_dones = neg_data["timeouts"] | neg_data["terminals"]
-    neg_rewards = neg_data["rewards"]
-    neg_costs = neg_data["costs"]
-
-    union_observations = union_data["observations"]
-    union_actions = union_data["actions"]
-    union_dones = union_data["timeouts"] | union_data["terminals"]
-    union_rewards = union_data["rewards"]
-    union_costs = union_data["costs"]
-
-    ep_len = ep_len // config["action_repeat"] + (ep_len % config["action_repeat"] > 0)
-    assert (
-        neg_observations.shape[1] == ep_len
-    ), f"{neg_observations.shape[1]} episode length is different from {ep_len}"
-
-    pos_data_size = 1
-    if has_positive:
-        pos_data_size = np.prod(pos_data["observations"].shape[:-1])
-
-    buffer = OSILBuffer(
-        rngs=rngs,
-        obs_dim=obs_space.shape[0],
-        act_dim=act_space.shape[0],
-        pos_data_size=pos_data_size,
-        neg_data_size=np.prod(neg_observations.shape[:-1]),
-        union_data_size=np.prod(union_observations.shape[:-1]),
-        horizon=config["train_horizon"],
-        batch_size=batch_size,
-        ep_len=ep_len,
+    dummy_obs = jnp.zeros((obs_dim,))
+    dummy_action = jnp.zeros((act_dim,))
+    dummy_transition = Transition(  # pytype: disable=wrong-arg-types  # jax-ndarray
+        observation=dummy_obs,
+        action=dummy_action,
+        reward=0.0,
+        discount=0.0,
+        next_observation=dummy_obs,
+        extras={"state_extras": {"truncation": 0.0}, "policy_extras": {}},
     )
 
-    if has_positive:
-        pos_observations = pos_data["observations"]
-        pos_actions = pos_data["actions"]
-        pos_dones = pos_data["timeouts"] | pos_data["terminals"]
-        pos_rewards = pos_data["rewards"]
-        pos_costs = pos_data["costs"]
-
-        for obs, act, done, reward, cost in zip(
-            pos_observations, pos_actions, pos_dones, pos_rewards, pos_costs
-        ):
-            buffer.add(obs, act, done, reward, cost, is_pos=True)
-
-    for obs, act, done, reward, cost in zip(
-        neg_observations, neg_actions, neg_dones, neg_rewards, neg_costs
-    ):
-        buffer.add(obs, act, done, reward, cost, is_neg=True)
-
-    for obs, act, done, reward, cost in zip(
-        union_observations, union_actions, union_dones, union_rewards, union_costs
-    ):
-        buffer.add(obs, act, done, reward, cost, is_union=True)
-
-    buffer.to_jax_ndarray()
-    data_buffer = buffer.get_data_buffer()
+    buffer = UniformSamplingQueue(
+        max_replay_size=config["max_replay_size"],
+        dummy_data_sample=dummy_transition,
+        sample_batch_size=batch_size,
+    )
+    prng_key, buffer_key = jax.random.split(prng_key)
+    buffer_state = buffer.init(buffer_key)
 
     # set logger
-    eval_rew_deque = deque(maxlen=config["eval_episode_freq"])
-    eval_cost_deque = deque(maxlen=config["eval_episode_freq"])
-    eval_len_deque = deque(maxlen=config["eval_episode_freq"])
     dict_args = config
     dict_args.update((k, v) for k, v in vars(args).items() if v is not None)
 
     logger = EpochLogger(log_dir=args.log_dir, seed=str(args.seed))
     logger.save_config(dict_args)
-    logger.log("Start cost and bc_policy model training.")
+    logger.log("Start prefilling buffer")
 
-    steps = 0
+    prng_key, buffer_key = jax.random.split(prng_key)
+    env_state, buffer_state = prefill_buffer(
+        key=buffer_key,
+        env=env,
+        env_state=env_state,
+        buffer_state=buffer_state,
+        policy=policy_model,
+        buffer=buffer,
+        num_itr=config["warmup_samples"],
+    )
+
+    logger.log("")
+    steps = buffer.size(buffer_state)
     while steps < config["total_iteration"]:
+        prng_key, subkey = jax.random.split(prng_key)
+
         val, num_itr = train_n_steps(
-            cost_model=cost_model,
-            cost_optimizer=cost_optimizer,
+            env=env,
+            env_state=env_state,
+            buffer_state=buffer_state,
+            buffer=buffer,
             value_model_target=value_model_target,
             value_model=value_model,
             value_optimizer=value_optimizer,
-            bc_policy_target=bc_policy_target,
-            bc_policy=bc_policy,
-            bc_optimizer=bc_optimizer,
-            data_buffer=data_buffer,
+            policy_model=policy_model,
+            policy_optimizer=policy_optimizer,
             config=config_data,
-            has_positive=has_positive,
-            key=rngs.random_sample(),
+            key=subkey,
         )
 
         (
@@ -600,22 +558,6 @@ def main(args, cfg_env=None):
         logger.logged = False
 
         if (steps % config["log_freq"] == 0) and (not logger.logged):
-            eval_episodes = config["eval_episode_freq"]
-            if args.use_eval:
-                eval_start_time = time.time()
-                for id in range(eval_episodes):
-                    (eval_reward, eval_cost, eval_len) = evaluate_bc_policy(
-                        eval_env, bc_policy.action, mu_obs, std_obs
-                    )
-                    eval_rew_deque.append(eval_reward)
-                    eval_cost_deque.append(eval_cost)
-                    eval_len_deque.append(eval_len)
-                eval_end_time = time.time()
-
-                logger.log_tabular("Metrics/EvalEpRet", np.mean(eval_rew_deque))
-                logger.log_tabular("Metrics/EvalEpCost", np.mean(eval_cost_deque))
-                logger.log_tabular("Metrics/EvalEpLen", np.mean(eval_len_deque))
-                logger.log_tabular("Time/Eval", eval_end_time - eval_start_time)
 
             logger.log_tabular("Train/Steps", steps)
 
@@ -650,25 +592,16 @@ def main(args, cfg_env=None):
             logger.log_tabular("Cost/union", mean_union_cost.item())
 
             logger.log_tabular(
-                "Norm/cost_model",
-                get_tree_norm(nnx.state(cost_model, nnx.Param)),
-            )
-            logger.log_tabular(
                 "Norm/value_model",
                 get_tree_norm(nnx.state(value_model, nnx.Param)),
             )
             logger.log_tabular(
-                "Norm/bc_policy",
-                get_tree_norm(nnx.state(bc_policy, nnx.Param)),
+                "Norm/policy_model",
+                get_tree_norm(nnx.state(policy_model, nnx.Param)),
             )
             logger.dump_tabular()
 
         if steps % config["save_freq"] == 0:
-            logger.nn_model_save(
-                itr=steps,
-                nn_model_saver_element=cost_model,
-                prefix="cost",
-            )
             logger.nn_model_save(
                 itr=steps,
                 nn_model_saver_element=value_model,
@@ -676,22 +609,17 @@ def main(args, cfg_env=None):
             )
             logger.nn_model_save(
                 itr=steps,
-                nn_model_saver_element=bc_policy,
-                prefix="bc_policy",
+                nn_model_saver_element=policy_model,
+                prefix="policy",
             )
 
         if steps >= config["total_iteration"]:
             break
 
-    logger.nn_model_save(itr=steps, nn_model_saver_element=cost_model, prefix="cost")
     logger.nn_model_save(itr=steps, nn_model_saver_element=value_model, prefix="value")
     logger.nn_model_save(
-        itr=steps, nn_model_saver_element=bc_policy, prefix="bc_policy"
+        itr=steps, nn_model_saver_element=policy_model, prefix="policy"
     )
-    if config["normalize_observation"]:
-        logger.save_state(
-            state_dict={"mu_obs": mu_obs, "std_obs": std_obs}, dirname="norm"
-        )
     logger.close()
 
 
