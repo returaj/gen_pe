@@ -17,7 +17,11 @@ from jax import debug
 from mujoco_playground import registry
 
 from gpe.utils import acting
-from gpe.utils.buffer import UniformSamplingQueue
+from gpe.utils.buffer import (
+    RunningStatistics,
+    RunningStatisticsState,
+    UniformSamplingQueue,
+)
 from gpe.utils.logger import EpochLogger
 from gpe.utils.models import EnsembleValue, MHPolicy, get_tree_norm
 from gpe.utils.types import Transition
@@ -37,7 +41,7 @@ default_cfg = {
     "weight_decay": 0.01,
     "episode_length": 1000,
     "warmup_samples": int(1e4),
-    "max_replay_size": int(1e6),
+    "max_replay_size": int(2e5),
     "total_iteration": int(1e6),
 }
 
@@ -138,7 +142,8 @@ def value_loss_grad_fun(
 
     # Batch X Horizon
     next_act, _ = policy_model(next_obs, act, key)
-    next_q = jnp.minimum(*target_value_model(jnp.concat([next_obs, next_act], axis=-1)))   
+    # Batch
+    next_q = jnp.minimum(*target_value_model(jnp.concat([next_obs, next_act], axis=-1)))
     target_v = reward + gamma * done * next_q
 
     def loss_fun(value_model):
@@ -238,6 +243,7 @@ def train_n_steps(
     env_state,
     buffer_state,
     buffer,
+    running_state,
     value_model_target,
     value_model,
     value_optimizer,
@@ -251,14 +257,15 @@ def train_n_steps(
     def body_fun(i, carry):
         (
             _,
-            key,
             env_state,
             buffer_state,
+            running_state,
             value_model_target,
             value_model,
             value_optimizer,
             policy_model,
             policy_optimizer,
+            key,
         ) = carry
 
         key, buffer_key, train_key = jax.random.split(key, 3)
@@ -271,6 +278,8 @@ def train_n_steps(
             policy=policy_model,
             buffer=buffer,
         )
+
+        running_state = RunningStatistics.insert_reward(running_state, env_state.reward)
 
         buffer_state, batch_data = buffer.sample(buffer_state)
 
@@ -288,31 +297,35 @@ def train_n_steps(
 
         return (
             val,
-            key,
             env_state,
             buffer_state,
+            running_state,
             value_model_target,
             value_model,
             value_optimizer,
             policy_model,
             policy_optimizer,
+            key,
         )
 
     init_val = (jnp.zeros((), dtype=jnp.float32),) * 6
     init_carry = (
         init_val,
-        key,
         env_state,
         buffer_state,
+        running_state,
         value_model_target,
         value_model,
         value_optimizer,
         policy_model,
         policy_optimizer,
+        key,
     )
-    val, *_ = nnx.fori_loop(0, num_steps, body_fun, init_carry)
+    val, env_state, buffer_state, running_state, *_ = nnx.fori_loop(
+        0, num_steps, body_fun, init_carry
+    )
 
-    return val, num_steps
+    return *val, env_state, buffer_state, running_state, num_steps
 
 
 def main(args, cfg_env=None):
@@ -335,6 +348,8 @@ def main(args, cfg_env=None):
     config["alpha"] = args.alpha
     config["beta"] = args.beta
     config["lmbda"] = args.lmbda
+    config["decay"] = args.decay
+    config["num_integral_steps"] = args.num_integral_steps
     config["policy_type"] = args.policy_type
     config["normalize_observation"] = args.normalize_observation
     config["lr"] = args.lr
@@ -362,6 +377,8 @@ def main(args, cfg_env=None):
         act_dim=act_dim,
         beta=config["beta"],
         hidden_size=config["hidden_size"],
+        decay=config["decay"],
+        num_itr=config["num_integral_steps"],
     )
     policy_optimizer = nnx.Optimizer(
         model=policy_model,
@@ -389,18 +406,6 @@ def main(args, cfg_env=None):
     )
     value_model_target = deepcopy(value_model)
 
-    # eval environment
-    eval_env_key = jax.random.split(eval_env_key, 1)
-    eval_env_state = env.reset(eval_env_key)
-    evaluate_fun = functools.partial(
-        acting.generate_unroll,
-        env=env, 
-        policy=policy_model, 
-        unroll_length=1000, 
-        extra_fields=("truncation",),
-    )
-    evaluate_fun_jit = jax.jit(evaluate_fun)
-
     dummy_obs = jnp.zeros((1, obs_dim))
     dummy_action = jnp.zeros((1, act_dim))
     dummy_zero = jnp.zeros((1,))
@@ -410,7 +415,7 @@ def main(args, cfg_env=None):
         reward=dummy_zero,
         discount=dummy_zero,
         next_observation=dummy_obs,
-        extras={"state_extras": {"truncation": dummy_zero}, },
+        extras={"state_extras": {"truncation": dummy_zero}},
     )
 
     buffer = UniformSamplingQueue(
@@ -420,6 +425,9 @@ def main(args, cfg_env=None):
     )
     prng_key, buffer_key = jax.random.split(prng_key)
     buffer_state = buffer.init(buffer_key)
+
+    prng_key, running_key = jax.random.split(prng_key)
+    running_state = RunningStatistics.init((config["episode_length"],), running_key)
 
     # set logger
     dict_args = config
@@ -445,11 +453,12 @@ def main(args, cfg_env=None):
     while steps < config["total_iteration"]:
         prng_key, subkey = jax.random.split(prng_key)
 
-        val, num_itr = train_n_steps(
+        val = train_n_steps(
             env=env,
             env_state=env_state,
             buffer_state=buffer_state,
             buffer=buffer,
+            running_state=running_state,
             value_model_target=value_model_target,
             value_model=value_model,
             value_optimizer=value_optimizer,
@@ -466,9 +475,13 @@ def main(args, cfg_env=None):
             policy_reg_loss,
             policy_qmean,
             policy_vmean,
+            env_state,
+            buffer_state,
+            running_state,
+            num_steps,
         ) = val
 
-        steps += num_itr
+        steps += num_steps
 
         logger.logged = False
 
@@ -480,7 +493,7 @@ def main(args, cfg_env=None):
             logger.log_tabular("Loss/Loss_policy", policy_loss.item())
             logger.log_tabular("Loss/Loss_policy_pg", policy_pg_loss.item())
             logger.log_tabular("Loss/Loss_policy_reg", policy_reg_loss.item())
-            
+
             logger.log_tabular("Loss/policy_q_value", policy_qmean.item())
             logger.log_tabular("Loss/policy_v_value", policy_vmean.item())
 
@@ -493,12 +506,7 @@ def main(args, cfg_env=None):
                 get_tree_norm(nnx.state(policy_model, nnx.Param)),
             )
 
-            if args.use_eval:
-                prng_key, eval_env_key = jax.random.split(prng_key)
-                eval_env_state, transition_data = evaluate_fun_jit(
-                    env_state=eval_env_state, key=eval_env_key
-                )
-                logger.log_tabular("Eval/Return", transition_data.reward.sum())
+            logger.log_tabular("Eval/Return", running_state.reward_state.data.sum())
 
             logger.dump_tabular()
 

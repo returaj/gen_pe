@@ -101,24 +101,6 @@ def single_agent_args():
             "help": "Default common learning rate for the models",
         },
         {
-            "name": "--lmbda",
-            "type": float,
-            "default": None,  # 1e-3 performs better
-            "help": "hyperparameter lambda value",
-        },
-        {
-            "name": "--alpha",
-            "type": float,
-            "default": None,  # 1e-3 performs better
-            "help": "hyperparameter lambda value",
-        },
-        {
-            "name": "--beta",
-            "type": float,
-            "default": None,  # 1e-3 performs better
-            "help": "hyperparameter lambda value",
-        },
-        {
             "name": "--policy-type",
             "type": str,
             "default": "mh_sampling",
@@ -129,6 +111,36 @@ def single_agent_args():
             "type": lambda x: bool(strtobool(x)),
             "default": False,
             "help": "To normalize the state observation.",
+        },
+        {
+            "name": "--lmbda",
+            "type": float,
+            "default": None,
+            "help": "hyperparameter lmbda value",
+        },
+        {
+            "name": "--alpha",
+            "type": float,
+            "default": None,
+            "help": "hyperparameter alpha value",
+        },
+        {
+            "name": "--beta",
+            "type": float,
+            "default": 1.0,
+            "help": "hyperparameter beta value",
+        },
+        {
+            "name": "--decay",
+            "type": float,
+            "default": 0.9,
+            "help": "hyperparameter decay value",
+        },
+        {
+            "name": "--num-integral-steps",
+            "type": int,
+            "default": 20,
+            "help": "hyperparameter num of integral sampling steps",
         },
     ]
     # Create argument parser

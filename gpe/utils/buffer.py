@@ -200,3 +200,44 @@ class UniformSamplingQueue(QueueBase[Sample], Generic[Sample]):
         )
         batch = jnp.take(buffer_state.data, idx, axis=0, mode="wrap")
         return buffer_state.replace(key=key), self._unflatten_fn(batch)
+
+
+@flax.struct.dataclass
+class RunningStatisticsState:
+    reward_state: ReplayBufferState
+
+
+class RunningStatistics:
+    @staticmethod
+    def init(reward_shape, key):
+        reward_state = ReplayBufferState(
+            data=jnp.zeros(reward_shape, jnp.float32),
+            sample_position=jnp.zeros((), jnp.int32),
+            insert_position=jnp.zeros((), jnp.int32),
+            key=key,
+        )
+        return RunningStatisticsState(reward_state=reward_state)
+
+    @staticmethod
+    def insert_reward(running_state: RunningStatisticsState, reward: jnp.ndarray):
+        reward_state = running_state.reward_state
+        data = reward_state.data
+        update = reward
+
+        # If needed, roll the buffer to make sure there's enough space to fit
+        # `update` after the current position.
+        position = reward_state.insert_position
+        roll = jnp.minimum(0, len(data) - position - len(update))
+        data = jax.lax.cond(roll, lambda: jnp.roll(data, roll, axis=0), lambda: data)
+        position = position + roll
+
+        # Update the buffer and the control numbers.
+        data = jax.lax.dynamic_update_slice_in_dim(data, update, position, axis=0)
+        position = (position + len(update)) % (len(data) + 1)
+        sample_position = jnp.maximum(0, reward_state.sample_position + roll)
+        reward_state = reward_state.replace(
+            data=data,
+            insert_position=position,
+            sample_position=sample_position,
+        )
+        return running_state.replace(reward_state=reward_state)

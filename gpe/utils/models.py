@@ -104,10 +104,28 @@ class PreferencePolicy(nnx.Module):
 
 
 class MHPolicy(PreferencePolicy):
-    def mh_sampling(self, obs, init_act, key, sigma=1.0, decay=0.9, num_itr=20):
+    def __init__(
+        self,
+        rngs,
+        obs_dim,
+        act_dim,
+        beta=1.0,
+        hidden_size=256,
+        clip_range=(-0.9, 0.9),
+        sigma=1.0,
+        decay=0.9,
+        num_itr=20,
+    ):
+        super().__init__(rngs, obs_dim, act_dim, beta, hidden_size, clip_range)
+        self.sigma = sigma
+        self.decay = decay
+        self.num_itr = num_itr
+
+    def mh_sampling(self, obs, init_act, key):
         # obs:  B X obs_dim
         # init_act: B X act_dim
 
+        sigma, decay = self.sigma, self.decay
         u_min, u_max = self.clip_range
 
         def body(i, carry):
@@ -116,17 +134,19 @@ class MHPolicy(PreferencePolicy):
             # sample new action
             u_new = u + sigma * jax.random.normal(subkey1, shape=u.shape, dtype=u.dtype)
             u_new = jnp.clip(u_new, min=u_min, max=u_max)
-            # estimate adv
-            adv = jnp.exp((self.h(obs, u_new) - self.h(obs, u)) / self.beta)
-            adv = jnp.minimum(1.0, adv)
+            # estimate adv = min(1.0, exp(h(s, u_new) / beta) / exp(h(s, u) / beta))
+            h_diff = jnp.clip(
+                (self.h(obs, u_new) - self.h(obs, u)) / self.beta, max=1.0
+            )
+            adv = jnp.minimum(1.0, jnp.exp(h_diff))
             # sample action wrt adv
             rand = jax.random.uniform(subkey2, shape=adv.shape)
-            select = (rand < adv).reshape(u.shape[0], 1)
+            select = jnp.expand_dims(rand < adv, -1)
             u = jnp.where(select, u_new, u)
             return (u, decay * sigma, key)
 
         init_carry = (init_act, sigma, key)
-        (u, sigma, _) = nnx.fori_loop(0, num_itr, body, init_carry)
+        (u, sigma, _) = nnx.fori_loop(0, self.num_itr, body, init_carry)
         return u, sigma
 
     def sampling(self, obs, init_act, key, **kwargs):
