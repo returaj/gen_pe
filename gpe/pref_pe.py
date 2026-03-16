@@ -185,7 +185,7 @@ def policy_loss_grad_fun(
         h = policy_model.h(obs, act)
         hpi = policy_model.h(obs, pi_act)
         pg_loss = jnp.mean(adv * (h - hpi))
-        reg_loss = config.lmbda * jnp.mean(h**2 + hpi**2)
+        reg_loss = 0.5 * config.lmbda * jnp.mean(h**2 + hpi**2)
         return pg_loss + reg_loss, (pg_loss, reg_loss)
 
     grad_fun = nnx.value_and_grad(loss_fun, has_aux=True)
@@ -360,7 +360,7 @@ def main(args, cfg_env=None):
     config_data = make_static_config_from_dict(name="State", d=config)()
 
     # training environment
-    prng_key, env_key, eval_env_key = jax.random.split(prng_key, 3)
+    prng_key, env_key = jax.random.split(prng_key)
     env_key = jax.random.split(env_key, 1)
     env = acting.wrap_env_for_training(
         env=registry.load(args.task),
