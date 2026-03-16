@@ -17,11 +17,7 @@ from jax import debug
 from mujoco_playground import registry
 
 from gpe.utils import acting
-from gpe.utils.buffer import (
-    RunningStatistics,
-    RunningStatisticsState,
-    UniformSamplingQueue,
-)
+from gpe.utils.buffer import RunningStatistics, UniformSamplingQueue
 from gpe.utils.logger import EpochLogger
 from gpe.utils.models import EnsembleValue, MHPolicy, get_tree_norm
 from gpe.utils.types import Transition
@@ -39,9 +35,10 @@ default_cfg = {
     "gamma": 0.99,
     "update_tau": 0.005,
     "weight_decay": 0.01,
+    "update_per_step": 2,
     "episode_length": 1000,
     "warmup_samples": int(1e4),
-    "max_replay_size": int(2e5),
+    "max_replay_size": int(1e6),
     "total_iteration": int(1e6),
 }
 
@@ -255,21 +252,12 @@ def train_n_steps(
     num_steps = config.log_freq
 
     def body_fun(i, carry):
-        (
-            _,
-            env_state,
-            buffer_state,
-            running_state,
-            value_model_target,
-            value_model,
-            value_optimizer,
-            policy_model,
-            policy_optimizer,
-            key,
-        ) = carry
+        key, env_state_val, buffer_state, models, val = carry
+        
+        env_state, running_state = env_state_val
+        policy_model = models[0]
 
-        key, buffer_key, train_key = jax.random.split(key, 3)
-
+        key, buffer_key = jax.random.split(key)
         env_state, buffer_state = get_experience(
             key=buffer_key,
             env=env,
@@ -278,54 +266,71 @@ def train_n_steps(
             policy=policy_model,
             buffer=buffer,
         )
-
         running_state = RunningStatistics.insert_reward(running_state, env_state.reward)
 
-        buffer_state, batch_data = buffer.sample(buffer_state)
+        def do_train(j, carry):
+            key, env_state_val, buffer_state, models, _ = carry
 
-        val = train_step(
-            value_model_target=value_model_target,
-            value_model=value_model,
-            value_optimizer=value_optimizer,
-            policy_model=policy_model,
-            policy_optimizer=policy_optimizer,
-            batch_data=batch_data,
-            config=config,
-            key=train_key,
-            steps=i,
-        )
+            policy_model, policy_optimizer, value_model_target, value_model, value_optimizer = models
 
-        return (
-            val,
-            env_state,
-            buffer_state,
-            running_state,
-            value_model_target,
-            value_model,
-            value_optimizer,
-            policy_model,
-            policy_optimizer,
+            buffer_state, batch_data = buffer.sample(buffer_state)
+
+            key, train_key = jax.random.split(key)            
+            steps = config.update_per_step * i + j
+            val = train_step(
+                value_model_target=value_model_target,
+                value_model=value_model,
+                value_optimizer=value_optimizer,
+                policy_model=policy_model,
+                policy_optimizer=policy_optimizer,
+                batch_data=batch_data,
+                config=config,
+                key=train_key,
+                steps=steps,
+            )
+
+            carry = (
+                key,
+                env_state_val,
+                buffer_state,
+                (policy_model, policy_optimizer, value_model_target, value_model, value_optimizer),
+                val,
+            )
+            return carry
+
+        init_carry = (
             key,
+            (env_state, running_state), 
+            buffer_state, 
+            models, 
+            val
         )
+        carry = nnx.fori_loop(0, config.update_per_step, do_train, init_carry)
+
+        return carry
 
     init_val = (jnp.zeros((), dtype=jnp.float32),) * 6
     init_carry = (
-        init_val,
-        env_state,
-        buffer_state,
-        running_state,
-        value_model_target,
-        value_model,
-        value_optimizer,
-        policy_model,
-        policy_optimizer,
         key,
+        (
+            env_state,
+            running_state,
+        ),
+        buffer_state,
+        (
+            policy_model,
+            policy_optimizer,
+            value_model_target,
+            value_model,
+            value_optimizer,
+        ),
+        init_val,
     )
-    val, env_state, buffer_state, running_state, *_ = nnx.fori_loop(
+    key, env_state_val, buffer_state, models, val = nnx.fori_loop(
         0, num_steps, body_fun, init_carry
     )
 
-    return *val, env_state, buffer_state, running_state, num_steps
+    return *val, *env_state_val, buffer_state, num_steps
 
 
 def main(args, cfg_env=None):
@@ -475,8 +480,8 @@ def main(args, cfg_env=None):
             policy_qmean,
             policy_vmean,
             env_state,
-            buffer_state,
             running_state,
+            buffer_state,
             num_steps,
         ) = val
 
