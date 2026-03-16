@@ -345,7 +345,6 @@ def main(args, cfg_env=None):
     jax.default_device = jax.devices(args.device)[args.device_id]
 
     config = default_cfg
-    config["alpha"] = args.alpha
     config["beta"] = args.beta
     config["lmbda"] = args.lmbda
     config["decay"] = args.decay
