@@ -114,19 +114,40 @@ class MHPolicy(PreferencePolicy):
         clip_range=(-0.9, 0.9),
         sigma=1.0,
         decay=0.9,
-        num_itr=20,
+        num_itr=10,
+        num_particles=5,
     ):
         super().__init__(rngs, obs_dim, act_dim, beta, hidden_size, clip_range)
         self.sigma = sigma
         self.decay = decay
         self.num_itr = num_itr
+        self.num_particles = num_particles
 
     def mh_sampling(self, obs, init_act, key):
         # obs:  B X obs_dim
         # init_act: B X act_dim
+        u = init_act
+        batch, act_dim = u.shape
+        obs_dim = obs.shape[-1]
 
         sigma, decay = self.sigma, self.decay
+        num_particles = self.num_particles
         u_min, u_max = self.clip_range
+
+        # sample particles
+        key, subkey = jax.random.split(key)
+        noise = sigma * jax.random.normal(subkey, shape=(batch, num_particles, act_dim))
+        # B X 1 X act_dim
+        u_expand = jnp.expand_dims(u, axis=1)
+        # B X num_particles X act_dim
+        u = u_expand + noise
+        # B X (num_particles + 1) X act_dim
+        u = jnp.concat([u_expand, u], axis=1)
+        u = jnp.clip(u, min=u_min, max=u_max)
+
+        # broadcast obs dims
+        obs = jnp.expand_dims(obs, axis=1)
+        obs = jnp.broadcast_to(obs, (batch, num_particles + 1, obs_dim))
 
         def body(i, carry):
             u, sigma, key = carry
@@ -135,6 +156,7 @@ class MHPolicy(PreferencePolicy):
             u_new = u + sigma * jax.random.normal(subkey1, shape=u.shape, dtype=u.dtype)
             u_new = jnp.clip(u_new, min=u_min, max=u_max)
             # estimate adv = min(1.0, exp(h(s, u_new) / beta) / exp(h(s, u) / beta))
+            # B X (num_particles + 1)
             h_diff = jnp.clip(
                 (self.h(obs, u_new) - self.h(obs, u)) / self.beta, max=1.0
             )
@@ -145,8 +167,15 @@ class MHPolicy(PreferencePolicy):
             u = jnp.where(select, u_new, u)
             return (u, decay * sigma, key)
 
-        init_carry = (init_act, sigma, key)
+        init_carry = (u, sigma, key)
+        # u: B X (num_particles + 1) X act_dim
         (u, sigma, _) = nnx.fori_loop(0, self.num_itr, body, init_carry)
+        
+        # h: B X (num_particles + 1)
+        # max_idx: B
+        max_idx = jnp.argmax(self.h(obs, u), axis=1)
+        # u: B X act_dim
+        u = jax.vmap(lambda x, idx: x[idx])(u, max_idx)
         return u, sigma
 
     def sampling(self, obs, init_act, key, **kwargs):
