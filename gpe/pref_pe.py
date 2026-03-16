@@ -135,13 +135,13 @@ def value_loss_grad_fun(
     act = data.action.reshape(batch * num_env, act_dim)
     next_obs = data.next_observation.reshape(batch * num_env, obs_dim)
     reward = data.reward.reshape(batch * num_env)
-    done = data.discount.reshape(batch * num_env)
+    discount = data.discount.reshape(batch * num_env)
 
     # Batch X Horizon
     next_act, _ = policy_model(next_obs, act, key)
     # Batch
     next_q = jnp.minimum(*target_value_model(jnp.concat([next_obs, next_act], axis=-1)))
-    target_v = reward + gamma * done * next_q
+    target_v = reward + gamma * discount * next_q
 
     def loss_fun(value_model):
         # Batch X Horizon X obs_act_dim
@@ -181,7 +181,7 @@ def policy_loss_grad_fun(
     def loss_fun(policy_model):
         h = policy_model.h(obs, act)
         hpi = policy_model.h(obs, pi_act)
-        pg_loss = jnp.mean(adv * (h - hpi))
+        pg_loss = -jnp.mean(adv * (h - hpi))
         reg_loss = 0.5 * config.lmbda * jnp.mean(h**2 + hpi**2)
         return pg_loss + reg_loss, (pg_loss, reg_loss)
 
