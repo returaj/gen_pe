@@ -63,9 +63,7 @@ def actor_step(
     """Collect data."""
 
     init_action = env_state.info["init_action"]
-    action, _ = policy(
-        env_state.obs, init_action, key
-    )  # add initial action info
+    action, _ = policy(env_state.obs, init_action, key)  # add initial action info
     n_env_state = env.step(env_state, action)
     state_extras = {x: n_env_state.info[x] for x in extra_fields}
     return (

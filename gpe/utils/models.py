@@ -170,7 +170,7 @@ class MHPolicy(PreferencePolicy):
         init_carry = (u, sigma, key)
         # u: B X (num_particles + 1) X act_dim
         (u, sigma, _) = nnx.fori_loop(0, self.num_itr, body, init_carry)
-        
+
         # h: B X (num_particles + 1)
         # max_idx: B
         max_idx = jnp.argmax(self.h(obs, u), axis=1)
