@@ -202,6 +202,120 @@ class UniformSamplingQueue(QueueBase[Sample], Generic[Sample]):
         return buffer_state.replace(key=key), self._unflatten_fn(batch)
 
 
+class ReplayBufferTrajState(ReplayBufferState):
+    horizon: int
+    curr_traj_len: int
+    mask: jnp.ndarray
+    priority: jnp.ndarray = None
+
+
+class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
+    def __init__(
+        self,
+        max_replay_size: int,
+        dummy_data_sample: Sample,
+        horizon: int,
+        sample_batch_size: int,
+    ):
+        super().__init__(max_replay_size, dummy_data_sample, sample_batch_size)
+        self._horizon = horizon
+
+    def init(self, key: PRNGKey) -> ReplayBufferTrajState:
+        return ReplayBufferTrajState(
+            data=jnp.zeros(self._data_shape, self._data_dtype),
+            mask=jnp.zeros(len(self._data_shape), self._data_dtype),
+            sample_position=jnp.zeros((), jnp.int32),
+            insert_position=jnp.zeros((), jnp.int32),
+            horizon=self._horizon,
+            curr_traj_len=jnp.zeros((), jnp.int32),
+            key=key,
+        )
+
+    def insert_internal(
+        self,
+        buffer_state: ReplayBufferTrajState,
+        samples: Sample,
+        discount: jnp.ndarray,
+    ) -> ReplayBufferTrajState:
+        """
+        Insert data in the replay buffer one transition at a time.
+        """
+
+        if buffer_state.data.shape != self._data_shape:
+            raise ValueError(
+                f"buffer_state.data.shape ({buffer_state.data.shape}) "
+                f"doesn't match the expected value ({self._data_shape})"
+            )
+
+        update = self._flatten_fn(samples)
+
+        if len(update) != 1 or len(discount) != 1:
+            raise ValueError(
+                f"number of transitions ({len(update)}) "
+                f"more than one transition passed."
+            )
+
+        horizon = buffer_state.horizon
+        curr_traj_len = buffer_state.curr_traj_len
+
+        data = buffer_state.data
+        mask = buffer_state.mask
+
+        # If needed, roll the buffer to make sure there's enough space to fit
+        # `update` after the current position.
+        position = buffer_state.insert_position
+        roll = jnp.minimum(0, len(data) - position - len(update))
+        data = jax.lax.cond(roll, lambda: jnp.roll(data, roll, axis=0), lambda: data)
+        position = position + roll
+
+        mask_start_pos = position + len(update) - 1
+        # end = start - (horizon - 1)
+        mask_end_pos = mask_start_pos - buffer_state.horizon + 1
+        # update current trajectory len
+        curr_traj_len = jnp.where(discount.sum(), curr_traj_len + 1, 0)
+
+        # Update buffer data
+        data = jax.lax.dynamic_update_slice_in_dim(data, update, position, axis=0)
+
+        # Update buffer mask
+        one_mask, zero_mask = jnp.array((1.0,)), jnp.array((0.0,))
+        mask = jax.lax.dynamic_update_slice_in_dim(
+            mask, one_mask, mask_start_pos, axis=0
+        )
+        # If the mask_end_pos is negative then it will update mask
+        # from the backside of the mask array. Currently there is no
+        # problem as the array is empty at the backside of the array.
+        mask = jax.lax.dynamic_update_slice_in_dim(
+            mask,
+            jnp.where(curr_traj_len > horizon, zero_mask, one_mask),
+            mask_end_pos,
+            axis=0,
+        )
+
+        # Update the control numbers.
+        position = (position + len(update)) % (len(data) + 1)
+        sample_position = jnp.maximum(0, buffer_state.sample_position + roll)
+
+        return buffer_state.replace(
+            data=data,
+            mask=mask,
+            curr_traj_len=curr_traj_len,
+            insert_position=position,
+            sample_position=sample_position,
+        )
+
+    def sample_internal(
+        self, buffer_state: ReplayBufferTrajState
+    ) -> Tuple[ReplayBufferTrajState, Sample]:
+        if buffer_state.data.shape != self._data_shape:
+            raise ValueError(
+                f"Data shape expected by the replay buffer ({self._data_shape}) does "
+                f"not match the shape of the buffer state ({buffer_state.data.shape})"
+            )
+
+        key, sample_key = jax.random.split(buffer_state.key)
+
+
 @flax.struct.dataclass
 class RunningStatisticsState:
     reward_state: ReplayBufferState
