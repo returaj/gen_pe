@@ -253,7 +253,7 @@ def train_n_steps(
 
     def body_fun(i, carry):
         key, env_state_val, buffer_state, models, val = carry
-        
+
         env_state, running_state = env_state_val
         policy_model = models[0]
 
@@ -271,11 +271,17 @@ def train_n_steps(
         def do_train(j, carry):
             key, env_state_val, buffer_state, models, _ = carry
 
-            policy_model, policy_optimizer, value_model_target, value_model, value_optimizer = models
+            (
+                policy_model,
+                policy_optimizer,
+                value_model_target,
+                value_model,
+                value_optimizer,
+            ) = models
 
             buffer_state, batch_data = buffer.sample(buffer_state)
 
-            key, train_key = jax.random.split(key)            
+            key, train_key = jax.random.split(key)
             steps = config.update_per_step * i + j
             val = train_step(
                 value_model_target=value_model_target,
@@ -293,18 +299,18 @@ def train_n_steps(
                 key,
                 env_state_val,
                 buffer_state,
-                (policy_model, policy_optimizer, value_model_target, value_model, value_optimizer),
+                (
+                    policy_model,
+                    policy_optimizer,
+                    value_model_target,
+                    value_model,
+                    value_optimizer,
+                ),
                 val,
             )
             return carry
 
-        init_carry = (
-            key,
-            (env_state, running_state), 
-            buffer_state, 
-            models, 
-            val
-        )
+        init_carry = (key, (env_state, running_state), buffer_state, models, val)
         carry = nnx.fori_loop(0, config.update_per_step, do_train, init_carry)
 
         return carry
