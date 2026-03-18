@@ -202,6 +202,7 @@ class UniformSamplingQueue(QueueBase[Sample], Generic[Sample]):
         return buffer_state.replace(key=key), self._unflatten_fn(batch)
 
 
+@flax.struct.dataclass
 class ReplayBufferTrajState(ReplayBufferState):
     horizon: int
     curr_traj_len: int
@@ -216,9 +217,13 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
         dummy_data_sample: Sample,
         horizon: int,
         sample_batch_size: int,
+        priority_alpha: float = 0.6,  # TD-MPC value
     ):
         super().__init__(max_replay_size, dummy_data_sample, sample_batch_size)
         self._horizon = horizon
+        self._priority_alpha = priority_alpha
+        # unflatten_fn for batch and horizon sample
+        self._unflatten_fn = jax.vmap(self._unflatten_fn)
 
     def init(self, key: PRNGKey) -> ReplayBufferTrajState:
         return ReplayBufferTrajState(
@@ -235,7 +240,6 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
         self,
         buffer_state: ReplayBufferTrajState,
         samples: Sample,
-        discount: jnp.ndarray,
     ) -> ReplayBufferTrajState:
         """
         Insert data in the replay buffer one transition at a time.
@@ -246,6 +250,9 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
                 f"buffer_state.data.shape ({buffer_state.data.shape}) "
                 f"doesn't match the expected value ({self._data_shape})"
             )
+
+        # samples is of type types.Transition
+        discount = samples.discount
 
         update = self._flatten_fn(samples)
 
@@ -266,11 +273,13 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
         position = buffer_state.insert_position
         roll = jnp.minimum(0, len(data) - position - len(update))
         data = jax.lax.cond(roll, lambda: jnp.roll(data, roll, axis=0), lambda: data)
+        mask = jax.lax.cond(roll, lambda: jnp.roll(mask, roll, axis=0), lambda: mask)
+
         position = position + roll
 
         mask_start_pos = position + len(update) - 1
         # end = start - (horizon - 1)
-        mask_end_pos = mask_start_pos - buffer_state.horizon + 1
+        mask_end_pos = jnp.maximum(0, mask_start_pos - buffer_state.horizon + 1)
         # update current trajectory len
         curr_traj_len = jnp.where(discount.sum(), curr_traj_len + 1, 0)
 
@@ -280,14 +289,11 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
         # Update buffer mask
         one_mask, zero_mask = jnp.array((1.0,)), jnp.array((0.0,))
         mask = jax.lax.dynamic_update_slice_in_dim(
-            mask, one_mask, mask_start_pos, axis=0
+            mask, zero_mask, mask_start_pos, axis=0
         )
-        # If the mask_end_pos is negative then it will update mask
-        # from the backside of the mask array. Currently there is no
-        # problem as the array is empty at the backside of the array.
         mask = jax.lax.dynamic_update_slice_in_dim(
             mask,
-            jnp.where(curr_traj_len > horizon, zero_mask, one_mask),
+            jnp.where(curr_traj_len > horizon, one_mask, zero_mask),
             mask_end_pos,
             axis=0,
         )
@@ -314,6 +320,27 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
             )
 
         key, sample_key = jax.random.split(buffer_state.key)
+
+        data = buffer_state.data
+        mask = buffer_state.mask
+
+        probs = mask**self._priority_alpha
+        probs /= probs.sum()
+        idxs = jax.random.choice(
+            key=sample_key,
+            a=len(mask),
+            shape=(self._sample_batch_size,),
+            p=probs,
+            replace=True,
+        )
+
+        horizon_offsets = jnp.arange(buffer_state.horizon)
+        # Batch X horizon
+        idxs = idxs[:, None] + horizon_offsets
+
+        # Batch X horizon X sample_dim
+        batch = data[idxs]
+        return buffer_state.replace(key=key), self._unflatten_fn(batch)
 
 
 @flax.struct.dataclass
