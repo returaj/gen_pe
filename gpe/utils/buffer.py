@@ -222,13 +222,14 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
         super().__init__(max_replay_size, dummy_data_sample, sample_batch_size)
         self._horizon = horizon
         self._priority_alpha = priority_alpha
+        self._max_replay_size = max_replay_size
         # unflatten_fn for batch and horizon sample
         self._unflatten_fn = jax.vmap(self._unflatten_fn)
 
     def init(self, key: PRNGKey) -> ReplayBufferTrajState:
         return ReplayBufferTrajState(
             data=jnp.zeros(self._data_shape, self._data_dtype),
-            mask=jnp.zeros(len(self._data_shape), self._data_dtype),
+            mask=jnp.zeros(self._max_replay_size, self._data_dtype),
             sample_position=jnp.zeros((), jnp.int32),
             insert_position=jnp.zeros((), jnp.int32),
             horizon=self._horizon,
@@ -280,8 +281,6 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
         mask_start_pos = position + len(update) - 1
         # end = start - (horizon - 1)
         mask_end_pos = jnp.maximum(0, mask_start_pos - buffer_state.horizon + 1)
-        # update current trajectory len
-        curr_traj_len = jnp.where(discount.sum(), curr_traj_len + 1, 0)
 
         # Update buffer data
         data = jax.lax.dynamic_update_slice_in_dim(data, update, position, axis=0)
@@ -293,12 +292,13 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
         )
         mask = jax.lax.dynamic_update_slice_in_dim(
             mask,
-            jnp.where(curr_traj_len > horizon, one_mask, zero_mask),
+            jnp.where(curr_traj_len + 1 >= horizon, one_mask, zero_mask),
             mask_end_pos,
             axis=0,
         )
 
         # Update the control numbers.
+        curr_traj_len = jnp.where(discount.sum(), curr_traj_len + 1, 0)
         position = (position + len(update)) % (len(data) + 1)
         sample_position = jnp.maximum(0, buffer_state.sample_position + roll)
 
