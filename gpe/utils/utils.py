@@ -113,6 +113,12 @@ def single_agent_args():
             "help": "To normalize the state observation.",
         },
         {
+            "name": "--train-horizon",
+            "type": int,
+            "default": None,
+            "help": "The horizon length used for training the models",
+        },
+        {
             "name": "--lmbda",
             "type": float,
             "default": None,

@@ -204,7 +204,6 @@ class UniformSamplingQueue(QueueBase[Sample], Generic[Sample]):
 
 @flax.struct.dataclass
 class ReplayBufferTrajState(ReplayBufferState):
-    horizon: int
     curr_traj_len: int
     mask: jnp.ndarray
     priority: jnp.ndarray = None
@@ -232,7 +231,6 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
             mask=jnp.zeros(self._max_replay_size, self._data_dtype),
             sample_position=jnp.zeros((), jnp.int32),
             insert_position=jnp.zeros((), jnp.int32),
-            horizon=self._horizon,
             curr_traj_len=jnp.zeros((), jnp.int32),
             key=key,
         )
@@ -263,7 +261,7 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
                 f"more than one transition passed."
             )
 
-        horizon = buffer_state.horizon
+        horizon = self._horizon
         curr_traj_len = buffer_state.curr_traj_len
 
         data = buffer_state.data
@@ -280,7 +278,7 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
 
         mask_start_pos = position + len(update) - 1
         # end = start - (horizon - 1)
-        mask_end_pos = jnp.maximum(0, mask_start_pos - buffer_state.horizon + 1)
+        mask_end_pos = jnp.maximum(0, mask_start_pos - horizon + 1)
 
         # Update buffer data
         data = jax.lax.dynamic_update_slice_in_dim(data, update, position, axis=0)
@@ -334,7 +332,7 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
             replace=True,
         )
 
-        horizon_offsets = jnp.arange(buffer_state.horizon)
+        horizon_offsets = jnp.arange(self._horizon)
         # Batch X horizon
         idxs = idxs[:, None] + horizon_offsets
 

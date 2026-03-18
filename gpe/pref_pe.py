@@ -17,7 +17,7 @@ from jax import debug
 from mujoco_playground import registry
 
 from gpe.utils import acting
-from gpe.utils.buffer import RunningStatistics, UniformSamplingQueue
+from gpe.utils.buffer import RunningStatistics, TrajectorySamplingQueue
 from gpe.utils.logger import EpochLogger
 from gpe.utils.models import EnsembleValue, MHPolicy, get_tree_norm
 from gpe.utils.types import Transition
@@ -36,6 +36,7 @@ default_cfg = {
     "update_tau": 0.005,
     "weight_decay": 0.01,
     "update_per_step": 2,
+    "train_horizon": 5,
     "episode_length": 1000,
     "warmup_samples": int(1e4),
     "max_replay_size": int(1e6),
@@ -59,13 +60,13 @@ def discounted_sum(arr, gamma):
     dtype = arr.dtype
     horizon = arr.shape[0]
 
-    def body_fun(t, cumsum):
+    def body_fun(cumsum, t):
         cumsum = arr[horizon - 1 - t] + gamma * cumsum
-        return cumsum
+        return (cumsum, cumsum)
 
     init_cumsum = jnp.zeros_like(arr[0], dtype=dtype)
-    cumsum = jax.lax.fori_loop(0, horizon, body_fun, init_cumsum)
-    return cumsum
+    cumsum, vec_cumsum = jax.lax.scan(body_fun, init_cumsum, jnp.arange(horizon))
+    return cumsum, jnp.flip(vec_cumsum, axis=0)
 
 
 def prefill_buffer(
@@ -119,29 +120,62 @@ def get_experience(
     return env_state, buffer_state
 
 
+def compute_target_value(
+    value, policy, obs, act, next_obs, reward, discount, config, key
+):
+    batch = obs.shape[0]
+    gamma, lmbda = config.gamma, config.lmbda
+
+    def body(h_obs, h_act, h_nobs, h_reward, h_discount, h_key):
+        # H + 1 X obs/act_dim
+        obs_seq = jnp.vstack([h_obs[0], h_nobs])
+        act_seq = jnp.vstack([h_act[0], h_act])
+        # H + 1 X act_dim
+        pi_act_seq, _ = policy(obs_seq, act_seq, h_key)
+        # H + 1
+        v = jnp.minimum(*value(jnp.concatenate([obs_seq, pi_act_seq], axis=-1)))
+        # H
+        td = h_reward + gamma * h_discount * v[1:] - v[:-1]
+        _, adv = discounted_sum(td, gamma * lmbda)
+        return adv + v[:-1]
+
+    key = jax.random.split(key, batch)
+    target_q = jax.vmap(body)(obs, act, next_obs, reward, discount, key)
+    return target_q
+
+
 def value_loss_grad_fun(
     target_value_model,
     value_model,
     policy_model,
     data,
-    gamma,
+    config,
     key,
 ):
-    batch, num_env, obs_dim = data.observation.shape
-    batch, num_env, act_dim = data.action.shape
+    batch, horizon, num_env, obs_dim = data.observation.shape
+    batch, horizon, num_env, act_dim = data.action.shape
 
-    # Batch X obs/act/()_dim
-    obs = data.observation.reshape(batch * num_env, obs_dim)
-    act = data.action.reshape(batch * num_env, act_dim)
-    next_obs = data.next_observation.reshape(batch * num_env, obs_dim)
-    reward = data.reward.reshape(batch * num_env)
-    discount = data.discount.reshape(batch * num_env)
+    assert num_env == 1, f"number of env should be set to 1 not {num_env}"
 
-    # Batch X Horizon
-    next_act, _ = policy_model(next_obs, act, key)
-    # Batch
-    next_q = jnp.minimum(*target_value_model(jnp.concat([next_obs, next_act], axis=-1)))
-    target_v = reward + gamma * discount * next_q
+    # Batch X H X obs/act/()_dim
+    obs = data.observation.reshape(batch, horizon, obs_dim)
+    act = data.action.reshape(batch, horizon, act_dim)
+    next_obs = data.next_observation.reshape(batch, horizon, obs_dim)
+    reward = data.reward.reshape(batch, horizon)
+    discount = data.discount.reshape(batch, horizon)
+
+    # Batch X H
+    target_v = compute_target_value(
+        value=target_value_model,
+        policy=policy_model,
+        obs=obs,
+        act=act,
+        next_obs=next_obs,
+        reward=reward,
+        discount=discount,
+        config=config,
+        key=key,
+    )
 
     def loss_fun(value_model):
         # Batch X Horizon X obs_act_dim
@@ -166,13 +200,22 @@ def policy_loss_grad_fun(
     config,
     key,
 ):
-    batch, num_env, obs_dim = data.observation.shape
-    batch, num_env, act_dim = data.action.shape
+    batch, horizon, num_env, obs_dim = data.observation.shape
+    batch, horizon, num_env, act_dim = data.action.shape
 
-    # Batch X obs/act/()_dim
-    obs = data.observation.reshape(batch * num_env, obs_dim)
-    act = data.action.reshape(batch * num_env, act_dim)
-    pi_act, _ = policy_model(obs, act, key)
+    assert num_env == 1, f"number of env should be set to 1 not {num_env}"
+
+    # Batch X H X obs/act/()_dim
+    obs = data.observation.reshape(batch, horizon, obs_dim)
+    act = data.action.reshape(batch, horizon, act_dim)
+
+    def pi(o, a, key):
+        pi_a, _ = policy_model(o, a, key)
+        return pi_a
+
+    key = jax.random.split(key, batch)
+    # B X H X act_dim
+    pi_act = jax.vmap(pi)(obs, act, key)
 
     q = jnp.minimum(*value_model(jnp.concat([obs, act], axis=-1)))
     v = jnp.minimum(*value_model(jnp.concat([obs, pi_act], axis=-1)))
@@ -182,7 +225,7 @@ def policy_loss_grad_fun(
         h = policy_model.h(obs, act)
         hpi = policy_model.h(obs, pi_act)
         pg_loss = -jnp.mean(adv * (h - hpi))
-        reg_loss = 0.5 * config.lmbda * jnp.mean(h**2 + hpi**2)
+        reg_loss = 0.5 * config.alpha * jnp.mean(h**2 + hpi**2)
         return pg_loss + reg_loss, (pg_loss, reg_loss)
 
     grad_fun = nnx.value_and_grad(loss_fun, has_aux=True)
@@ -209,7 +252,7 @@ def train_step(
         value_model=value_model,
         policy_model=policy_model,
         data=batch_data,
-        gamma=config.gamma,
+        config=config,
         key=value_key,
     )
     value_optimizer.update(value_grads)
@@ -356,6 +399,8 @@ def main(args, cfg_env=None):
     jax.default_device = jax.devices(args.device)[args.device_id]
 
     config = default_cfg
+    config["train_horizon"] = args.train_horizon
+    config["alpha"] = args.alpha
     config["beta"] = args.beta
     config["lmbda"] = args.lmbda
     config["decay"] = args.decay
@@ -428,10 +473,11 @@ def main(args, cfg_env=None):
         extras={"state_extras": {"truncation": dummy_zero}},
     )
 
-    buffer = UniformSamplingQueue(
+    buffer = TrajectorySamplingQueue(
         max_replay_size=config["max_replay_size"],
         dummy_data_sample=dummy_transition,
         sample_batch_size=batch_size,
+        horizon=config["train_horizon"],
     )
     prng_key, buffer_key = jax.random.split(prng_key)
     buffer_state = buffer.init(buffer_key)
