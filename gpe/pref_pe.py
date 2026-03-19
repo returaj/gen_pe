@@ -39,8 +39,8 @@ default_cfg = {
     "train_horizon": 5,
     "episode_length": 1000,
     "warmup_samples": int(1e4),
-    "max_replay_size": int(1e6),
-    "total_iteration": int(1e6),
+    "max_replay_size": int(5e5),
+    "total_iteration": int(5e5),
 }
 
 
