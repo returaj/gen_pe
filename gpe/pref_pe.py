@@ -552,6 +552,8 @@ def main(args, cfg_env=None):
             logger.log_tabular("Loss/policy_q_value", policy_qmean.item())
             logger.log_tabular("Loss/policy_v_value", policy_vmean.item())
 
+            logger.log_tabular("Buffer/max_priority", buffer_state.max_priority)
+
             logger.log_tabular(
                 "Norm/value_model",
                 get_tree_norm(nnx.state(value_model, nnx.Param)),
