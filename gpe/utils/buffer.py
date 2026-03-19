@@ -26,6 +26,11 @@ State = TypeVar("State")
 Sample = TypeVar("Sample")
 
 
+@jax.jit
+def update_arr_jit(arr, idxs, val):
+    return arr.at[idxs].set(val)
+
+
 class ReplayBuffer(abc.ABC, Generic[State, Sample]):
     """Contains replay buffer methods."""
 
@@ -206,7 +211,7 @@ class UniformSamplingQueue(QueueBase[Sample], Generic[Sample]):
 class ReplayBufferTrajState(ReplayBufferState):
     curr_traj_len: int
     mask: jnp.ndarray
-    priority: jnp.ndarray = None
+    max_priority: float
 
 
 class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
@@ -232,6 +237,7 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
             sample_position=jnp.zeros((), jnp.int32),
             insert_position=jnp.zeros((), jnp.int32),
             curr_traj_len=jnp.zeros((), jnp.int32),
+            max_priority=1.0,
             key=key,
         )
 
@@ -284,13 +290,14 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
         data = jax.lax.dynamic_update_slice_in_dim(data, update, position, axis=0)
 
         # Update buffer mask
-        one_mask, zero_mask = jnp.array((1.0,)), jnp.array((0.0,))
+        max_priority = jnp.maximum(1.0, buffer_state.max_priority)
+        select_mask, dselect_mask = jnp.array((max_priority,)), jnp.array((0.0,))
         mask = jax.lax.dynamic_update_slice_in_dim(
-            mask, zero_mask, mask_start_pos, axis=0
+            mask, dselect_mask, mask_start_pos, axis=0
         )
         mask = jax.lax.dynamic_update_slice_in_dim(
             mask,
-            jnp.where(curr_traj_len + 1 >= horizon, one_mask, zero_mask),
+            jnp.where(curr_traj_len + 1 >= horizon, select_mask, dselect_mask),
             mask_end_pos,
             axis=0,
         )
@@ -303,10 +310,24 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
         return buffer_state.replace(
             data=data,
             mask=mask,
+            max_priority=max_priority,
             curr_traj_len=curr_traj_len,
             insert_position=position,
             sample_position=sample_position,
         )
+
+    def update_priorities(
+        self,
+        buffer_state: ReplayBufferTrajState,
+        idxs: jnp.ndarray,
+        priorities: jnp.ndarray,
+    ):
+        # idxs: Batch
+        # priorities: Batch
+        mask = buffer_state.mask
+        mask = update_arr_jit(mask, idxs, priorities)
+        max_priority = jnp.maximum(buffer_state.max_priority, priorities.max())
+        return buffer_state.replace(mask=mask, max_priority=max_priority)
 
     def sample_internal(
         self, buffer_state: ReplayBufferTrajState
@@ -324,6 +345,7 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
 
         probs = mask**self._priority_alpha
         probs /= probs.sum()
+        # Batch
         idxs = jax.random.choice(
             key=sample_key,
             a=len(mask),
@@ -334,11 +356,11 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
 
         horizon_offsets = jnp.arange(self._horizon)
         # Batch X horizon
-        idxs = idxs[:, None] + horizon_offsets
-
+        offset_idxs = idxs[:, None] + horizon_offsets
         # Batch X horizon X sample_dim
-        batch = data[idxs]
-        return buffer_state.replace(key=key), self._unflatten_fn(batch)
+        batch = data[offset_idxs]
+
+        return buffer_state.replace(key=key), self._unflatten_fn(batch), idxs
 
 
 @flax.struct.dataclass

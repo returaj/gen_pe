@@ -185,12 +185,14 @@ def value_loss_grad_fun(
         v1_loss = optax.huber_loss(pred_v1, target_v, delta=2.0)
         v2_loss = optax.huber_loss(pred_v2, target_v, delta=2.0)
         loss = jnp.mean(v1_loss) + jnp.mean(v2_loss)
-        return loss
+        # Batch
+        priority_loss = jnp.clip((v1_loss + v2_loss)[:, 0], max=1e2)
+        return loss, (priority_loss,)
 
-    grad_fun = nnx.value_and_grad(loss_fun)
-    loss, grads = grad_fun(value_model)
+    grad_fun = nnx.value_and_grad(loss_fun, has_aux=True)
+    (loss, aux_value), grads = grad_fun(value_model)
 
-    return loss, grads
+    return loss, grads, *aux_value
 
 
 def policy_loss_grad_fun(
@@ -247,7 +249,7 @@ def train_step(
 ):
     value_key, policy_key = jax.random.split(key)
 
-    value_loss, value_grads = value_loss_grad_fun(
+    value_loss, value_grads, *priority_aux = value_loss_grad_fun(
         target_value_model=value_model_target,
         value_model=value_model,
         policy_model=policy_model,
@@ -270,11 +272,7 @@ def train_step(
         value_model_target, value_model, config.update_tau
     )
 
-    return (
-        value_loss,
-        policy_loss,
-        *policy_aux,
-    )
+    return *priority_aux, (value_loss, policy_loss, *policy_aux)
 
 
 @functools.partial(nnx.jit, static_argnames=("env", "buffer"))
@@ -322,11 +320,11 @@ def train_n_steps(
                 value_optimizer,
             ) = models
 
-            buffer_state, batch_data = buffer.sample(buffer_state)
+            buffer_state, batch_data, idxs = buffer.sample(buffer_state)
 
             key, train_key = jax.random.split(key)
             steps = config.update_per_step * i + j
-            val = train_step(
+            priority, val = train_step(
                 value_model_target=value_model_target,
                 value_model=value_model,
                 value_optimizer=value_optimizer,
@@ -337,6 +335,7 @@ def train_n_steps(
                 key=train_key,
                 steps=steps,
             )
+            buffer_state = buffer.update_priorities(buffer_state, idxs, priority)
 
             carry = (
                 key,
