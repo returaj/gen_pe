@@ -62,8 +62,13 @@ def actor_step(
 ) -> Tuple[types.EnvState, types.Transition]:
     """Collect data."""
 
-    init_action = env_state.info["init_action"]
-    action, _ = policy(env_state.obs, init_action, key)  # add initial action info
+    # we need to expand dim as policy need B X horizon X dim
+    # B X 1 X obs/act_dim
+    init_action = jnp.expand_dims(env_state.info["init_action"], axis=1)
+    obs = jnp.expand_dims(env_state.obs, axis=1)
+    action, _ = policy(obs, init_action, key)  # add initial action info
+    # B X act_dim
+    action = jnp.squeeze(action, axis=1)
     n_env_state = env.step(env_state, action)
     state_extras = {x: n_env_state.info[x] for x in extra_fields}
     return (

@@ -29,7 +29,7 @@ EPS = 1e-6
 default_cfg = {
     "log_freq": int(1e4),
     "save_freq": int(2e4),
-    "eval_episode_freq": 1,  # use saved bc_policy to run evaluatation
+    "eval_episode_freq": 5,  # use saved bc_policy to run evaluatation
     "hidden_size": 256,
     "max_grad_norm": 10.0,
     "gamma": 0.99,
@@ -123,24 +123,24 @@ def get_experience(
 def compute_target_value(
     value, policy, obs, act, next_obs, reward, discount, config, key
 ):
-    batch = obs.shape[0]
     gamma, lmbda = config.gamma, config.lmbda
 
-    def body(h_obs, h_act, h_nobs, h_reward, h_discount, h_key):
-        # H + 1 X obs/act_dim
-        obs_seq = jnp.vstack([h_obs[0], h_nobs])
-        act_seq = jnp.vstack([h_act[0], h_act])
-        # H + 1 X act_dim
-        pi_act_seq, _ = policy(obs_seq, act_seq, h_key)
-        # H + 1
-        v = jnp.minimum(*value(jnp.concatenate([obs_seq, pi_act_seq], axis=-1)))
-        # H
-        td = h_reward + gamma * h_discount * v[1:] - v[:-1]
-        _, adv = discounted_sum(td, gamma * lmbda)
-        return adv + v[:-1]
+    # B X 1 X obs_dim
+    curr_obs = jnp.expand_dims(obs[:, 0], axis=1)
+    curr_act = jnp.expand_dims(act[:, 0], axis=1)
+    # B X H+1 X obs/act_dim
+    obs_seq = jnp.concatenate([curr_obs, next_obs], axis=1)
+    act_seq = jnp.concatenate([curr_act, act], axis=1)
 
-    key = jax.random.split(key, batch)
-    target_q = jax.vmap(body)(obs, act, next_obs, reward, discount, key)
+    pi_act_seq, _ = policy(obs_seq, act_seq, key)
+    # B X H+1
+    v = jnp.minimum(*value(jnp.concatenate([obs_seq, pi_act_seq], axis=-1)))
+    # B X H
+    td = reward + gamma * discount * v[:, 1:] - v[:, :-1]
+    # H X B
+    _, adv_transpose = discounted_sum(td.T, gamma * lmbda)
+    # B X H
+    target_q = adv_transpose.T + v[:, :-1]
     return target_q
 
 
@@ -212,13 +212,8 @@ def policy_loss_grad_fun(
     obs = data.observation.reshape(batch, horizon, obs_dim)
     act = data.action.reshape(batch, horizon, act_dim)
 
-    def pi(o, a, key):
-        pi_a, _ = policy_model(o, a, key)
-        return pi_a
-
-    key = jax.random.split(key, batch)
     # B X H X act_dim
-    pi_act = jax.vmap(pi)(obs, act, key)
+    pi_act, _ = policy_model(obs, act, key)
 
     q = jnp.minimum(*value_model(jnp.concat([obs, act], axis=-1)))
     v = jnp.minimum(*value_model(jnp.concat([obs, pi_act], axis=-1)))
@@ -483,7 +478,9 @@ def main(args, cfg_env=None):
     buffer_state = buffer.init(buffer_key)
 
     prng_key, running_key = jax.random.split(prng_key)
-    running_state = RunningStatistics.init((config["episode_length"],), running_key)
+    running_state = RunningStatistics.init(
+        (config["eval_episode_freq"] * config["episode_length"],), running_key
+    )
 
     # set logger
     dict_args = config
