@@ -36,10 +36,10 @@ default_cfg = {
     "update_tau": 0.005,
     "weight_decay": 0.01,
     "update_per_step": 2,
-    "train_horizon": 5,
+    "train_horizon": 10,
     "episode_length": 1000,
-    "warmup_samples": int(1e4),
-    "max_replay_size": int(5e5),
+    "warmup_samples": int(1e3),
+    "max_replay_size": int(6e5),
     "total_iteration": int(5e5),
 }
 
@@ -186,7 +186,8 @@ def value_loss_grad_fun(
         v2_loss = optax.huber_loss(pred_v2, target_v, delta=2.0)
         loss = jnp.mean(v1_loss) + jnp.mean(v2_loss)
         # Batch
-        priority_loss = jnp.clip((v1_loss + v2_loss)[:, 0], max=1e2)
+        priority = 0.5 * (jnp.abs(pred_v1 - target_v) + jnp.abs(pred_v2 - target_v))
+        priority_loss = jnp.clip(priority[:, 0], max=1e4)
         return loss, (priority_loss,)
 
     grad_fun = nnx.value_and_grad(loss_fun, has_aux=True)
@@ -540,34 +541,33 @@ def main(args, cfg_env=None):
 
         logger.logged = False
 
-        if (steps % config["log_freq"] == 0) and (not logger.logged):
-            logger.log_tabular("Train/Steps", steps)
+        logger.log_tabular("Train/Steps", steps)
 
-            logger.log_tabular("Loss/Loss_value", value_loss.item())
+        logger.log_tabular("Loss/Loss_value", value_loss.item())
 
-            logger.log_tabular("Loss/Loss_policy", policy_loss.item())
-            logger.log_tabular("Loss/Loss_policy_pg", policy_pg_loss.item())
-            logger.log_tabular("Loss/Loss_policy_reg", policy_reg_loss.item())
+        logger.log_tabular("Loss/Loss_policy", policy_loss.item())
+        logger.log_tabular("Loss/Loss_policy_pg", policy_pg_loss.item())
+        logger.log_tabular("Loss/Loss_policy_reg", policy_reg_loss.item())
 
-            logger.log_tabular("Loss/policy_q_value", policy_qmean.item())
-            logger.log_tabular("Loss/policy_v_value", policy_vmean.item())
+        logger.log_tabular("Loss/policy_q_value", policy_qmean.item())
+        logger.log_tabular("Loss/policy_v_value", policy_vmean.item())
 
-            logger.log_tabular("Buffer/max_priority", buffer_state.max_priority)
+        logger.log_tabular("Buffer/max_priority", buffer_state.max_priority)
 
-            logger.log_tabular(
-                "Norm/value_model",
-                get_tree_norm(nnx.state(value_model, nnx.Param)),
-            )
-            logger.log_tabular(
-                "Norm/policy_model",
-                get_tree_norm(nnx.state(policy_model, nnx.Param)),
-            )
+        logger.log_tabular(
+            "Norm/value_model",
+            get_tree_norm(nnx.state(value_model, nnx.Param)),
+        )
+        logger.log_tabular(
+            "Norm/policy_model",
+            get_tree_norm(nnx.state(policy_model, nnx.Param)),
+        )
 
-            logger.log_tabular("Eval/Return", running_state.reward_state.data.sum())
+        logger.log_tabular("Eval/Return", running_state.reward_state.data.sum())
 
-            logger.dump_tabular()
+        logger.dump_tabular()
 
-        if steps % config["save_freq"] == 0:
+        if (steps - config["warmup_samples"]) % config["save_freq"] == 0:
             logger.nn_model_save(
                 itr=steps,
                 nn_model_saver_element=value_model,

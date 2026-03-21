@@ -290,7 +290,7 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
         data = jax.lax.dynamic_update_slice_in_dim(data, update, position, axis=0)
 
         # Update buffer mask
-        max_priority = jnp.maximum(1.0, buffer_state.max_priority)
+        max_priority = jnp.maximum(1.0, mask.max())
         select_mask, dselect_mask = jnp.array((max_priority,)), jnp.array((0.0,))
         mask = jax.lax.dynamic_update_slice_in_dim(
             mask, dselect_mask, mask_start_pos, axis=0
@@ -324,10 +324,13 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
     ):
         # idxs: Batch
         # priorities: Batch
+        assert (
+            idxs.shape[0] == priorities.shape[0] == self._sample_batch_size
+        ), "update priorities shape doesnot match"
+
         mask = buffer_state.mask
         mask = update_arr_jit(mask, idxs, priorities)
-        max_priority = jnp.maximum(buffer_state.max_priority, priorities.max())
-        return buffer_state.replace(mask=mask, max_priority=max_priority)
+        return buffer_state.replace(mask=mask)
 
     def sample_internal(
         self, buffer_state: ReplayBufferTrajState
