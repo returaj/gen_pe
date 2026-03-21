@@ -16,7 +16,7 @@ from flax import nnx
 from jax import debug
 from mujoco_playground import registry
 
-from gpe.utils import acting
+from gpe.utils import acting, types
 from gpe.utils.buffer import RunningStatistics, TrajectorySamplingQueue
 from gpe.utils.logger import EpochLogger
 from gpe.utils.models import EnsembleValue, MHPolicy, get_tree_norm
@@ -67,6 +67,29 @@ def discounted_sum(arr, gamma):
     init_cumsum = jnp.zeros_like(arr[0], dtype=dtype)
     cumsum, vec_cumsum = jax.lax.scan(body_fun, init_cumsum, jnp.arange(horizon))
     return cumsum, jnp.flip(vec_cumsum, axis=0)
+
+
+def reshape_transition(data):
+    batch, horizon, num_env, obs_dim = data.observation.shape
+    batch, horizon, num_env, act_dim = data.action.shape
+
+    assert num_env == 1, f"number of env should be set to 1 not {num_env}"
+
+    # Batch X H X obs/act/()_dim
+    obs = data.observation.reshape(batch, horizon, obs_dim)
+    act = data.action.reshape(batch, horizon, act_dim)
+    next_obs = data.next_observation.reshape(batch, horizon, obs_dim)
+    reward = data.reward.reshape(batch, horizon)
+    discount = data.discount.reshape(batch, horizon)
+
+    return types.Transition(
+        observation=obs,
+        action=act,
+        next_observation=next_obs,
+        reward=reward,
+        discount=discount,
+        extras=data.extras,
+    )
 
 
 def prefill_buffer(
@@ -120,23 +143,18 @@ def get_experience(
     return env_state, buffer_state
 
 
-def compute_target_value(
-    value, policy, obs, act, next_obs, reward, discount, config, key
-):
+def compute_target_value(value, data, pi_act_seq, config):
     gamma, lmbda = config.gamma, config.lmbda
 
     # B X 1 X obs_dim
-    curr_obs = jnp.expand_dims(obs[:, 0], axis=1)
-    curr_act = jnp.expand_dims(act[:, 0], axis=1)
-    # B X H+1 X obs/act_dim
-    obs_seq = jnp.concatenate([curr_obs, next_obs], axis=1)
-    act_seq = jnp.concatenate([curr_act, act], axis=1)
+    curr_obs = jnp.expand_dims(data.observation[:, 0], axis=1)
+    # B X H+1 X obs_dim
+    obs_seq = jnp.concatenate([curr_obs, data.next_observation], axis=1)
 
-    pi_act_seq, _ = policy(obs_seq, act_seq, key)
     # B X H+1
     v = jnp.minimum(*value(jnp.concatenate([obs_seq, pi_act_seq], axis=-1)))
     # B X H
-    td = reward + gamma * discount * v[:, 1:] - v[:, :-1]
+    td = data.reward + gamma * data.discount * v[:, 1:] - v[:, :-1]
     # H X B
     _, adv_transpose = discounted_sum(td.T, gamma * lmbda)
     # B X H
@@ -147,39 +165,16 @@ def compute_target_value(
 def value_loss_grad_fun(
     target_value_model,
     value_model,
-    policy_model,
     data,
+    pi_act_seq,
     config,
-    key,
 ):
-    batch, horizon, num_env, obs_dim = data.observation.shape
-    batch, horizon, num_env, act_dim = data.action.shape
-
-    assert num_env == 1, f"number of env should be set to 1 not {num_env}"
-
-    # Batch X H X obs/act/()_dim
-    obs = data.observation.reshape(batch, horizon, obs_dim)
-    act = data.action.reshape(batch, horizon, act_dim)
-    next_obs = data.next_observation.reshape(batch, horizon, obs_dim)
-    reward = data.reward.reshape(batch, horizon)
-    discount = data.discount.reshape(batch, horizon)
-
     # Batch X H
-    target_v = compute_target_value(
-        value=target_value_model,
-        policy=policy_model,
-        obs=obs,
-        act=act,
-        next_obs=next_obs,
-        reward=reward,
-        discount=discount,
-        config=config,
-        key=key,
-    )
+    target_v = compute_target_value(target_value_model, data, pi_act_seq, config)
 
     def loss_fun(value_model):
         # Batch X Horizon X obs_act_dim
-        target_oa = jnp.concat([obs, act], axis=-1)
+        target_oa = jnp.concat([data.observation, data.action], axis=-1)
         # Batch X Horizon
         pred_v1, pred_v2 = value_model(target_oa)
         v1_loss = optax.huber_loss(pred_v1, target_v, delta=2.0)
@@ -200,20 +195,13 @@ def policy_loss_grad_fun(
     value_model,
     policy_model,
     data,
+    pi_act_seq,
     config,
-    key,
 ):
-    batch, horizon, num_env, obs_dim = data.observation.shape
-    batch, horizon, num_env, act_dim = data.action.shape
-
-    assert num_env == 1, f"number of env should be set to 1 not {num_env}"
-
-    # Batch X H X obs/act/()_dim
-    obs = data.observation.reshape(batch, horizon, obs_dim)
-    act = data.action.reshape(batch, horizon, act_dim)
-
-    # B X H X act_dim
-    pi_act, _ = policy_model(obs, act, key)
+    # B X H X obs/act_dim
+    obs = data.observation
+    act = data.action
+    pi_act = pi_act_seq[:, :-1]
 
     q = jnp.minimum(*value_model(jnp.concat([obs, act], axis=-1)))
     v = jnp.minimum(*value_model(jnp.concat([obs, pi_act], axis=-1)))
@@ -238,29 +226,38 @@ def train_step(
     value_optimizer,
     policy_model,
     policy_optimizer,
-    batch_data,
+    data,
     config,
     key,
     steps,
 ):
-    value_key, policy_key = jax.random.split(key)
+    data = reshape_transition(data)
+
+    # B X 1 X obs_dim
+    curr_obs = jnp.expand_dims(data.observation[:, 0], axis=1)
+    curr_act = jnp.expand_dims(data.action[:, 0], axis=1)
+    # B X H+1 X obs/act_dim
+    obs_seq = jnp.concatenate([curr_obs, data.next_observation], axis=1)
+    init_act_seq = jnp.concatenate([curr_act, data.action], axis=1)
+
+    # B X H+1 X act_dim
+    pi_act_seq, _ = policy_model(obs_seq, init_act_seq, key)
 
     value_loss, value_grads, *priority_aux = value_loss_grad_fun(
         target_value_model=value_model_target,
         value_model=value_model,
-        policy_model=policy_model,
-        data=batch_data,
+        data=data,
+        pi_act_seq=pi_act_seq,
         config=config,
-        key=value_key,
     )
     value_optimizer.update(value_grads)
 
     policy_loss, policy_grads, *policy_aux = policy_loss_grad_fun(
         value_model=value_model,
         policy_model=policy_model,
-        data=batch_data,
+        data=data,
+        pi_act_seq=pi_act_seq,
         config=config,
-        key=policy_key,
     )
     policy_optimizer.update(policy_grads)
 
@@ -326,7 +323,7 @@ def train_n_steps(
                 value_optimizer=value_optimizer,
                 policy_model=policy_model,
                 policy_optimizer=policy_optimizer,
-                batch_data=batch_data,
+                data=batch_data,
                 config=config,
                 key=train_key,
                 steps=steps,
