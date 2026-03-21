@@ -563,7 +563,10 @@ def main(args, cfg_env=None):
             get_tree_norm(nnx.state(policy_model, nnx.Param)),
         )
 
-        logger.log_tabular("Eval/Return", running_state.reward_state.data.sum())
+        logger.log_tabular(
+            "Eval/Return",
+            running_state.reward_state.data.sum() / config["eval_episode_freq"],
+        )
 
         logger.dump_tabular()
 
