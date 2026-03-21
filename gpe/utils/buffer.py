@@ -354,7 +354,7 @@ class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
             a=len(mask),
             shape=(self._sample_batch_size,),
             p=probs,
-            replace=True,
+            replace=False,
         )
 
         horizon_offsets = jnp.arange(self._horizon)
