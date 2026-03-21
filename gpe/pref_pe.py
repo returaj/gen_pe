@@ -35,7 +35,8 @@ default_cfg = {
     "gamma": 0.99,
     "update_tau": 0.005,
     "weight_decay": 0.01,
-    "update_per_step": 2,
+    "train_per_step": 2,
+    "policy_update_freq": 2,
     "train_horizon": 10,
     "episode_length": 1000,
     "warmup_samples": int(1e3),
@@ -259,13 +260,18 @@ def train_step(
         pi_act_seq=pi_act_seq,
         config=config,
     )
+    policy_cond = (steps % config.policy_update_freq) == 0
+    policy_grads = jax.tree.map(
+        lambda g: jnp.where(policy_cond, g, jnp.zeros_like(g)),
+        policy_grads,
+    )
     policy_optimizer.update(policy_grads)
 
     value_model_target = polyak_update(
         value_model_target, value_model, config.update_tau
     )
 
-    return *priority_aux, (value_loss, policy_loss, *policy_aux)
+    return *priority_aux, (value_loss, policy_cond * policy_loss, *policy_aux)
 
 
 @functools.partial(nnx.jit, static_argnames=("env", "buffer"))
@@ -316,7 +322,7 @@ def train_n_steps(
             buffer_state, batch_data, idxs = buffer.sample(buffer_state)
 
             key, train_key = jax.random.split(key)
-            steps = config.update_per_step * i + j
+            steps = config.train_per_step * i + j
             priority, val = train_step(
                 value_model_target=value_model_target,
                 value_model=value_model,
@@ -346,7 +352,7 @@ def train_n_steps(
             return carry
 
         init_carry = (key, (env_state, running_state), buffer_state, models, val)
-        carry = nnx.fori_loop(0, config.update_per_step, do_train, init_carry)
+        carry = nnx.fori_loop(1, config.train_per_step + 1, do_train, init_carry)
 
         return carry
 
