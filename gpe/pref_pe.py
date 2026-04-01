@@ -419,6 +419,7 @@ def main(args, cfg_env=None):
     env = acting.wrap_env_for_training(
         env=registry.load(args.task),
         episode_length=config["episode_length"],
+        full_reset=True,
     )
     env_state = env.reset(env_key)
 
