@@ -16,8 +16,8 @@ from flax import nnx
 from jax import debug
 from mujoco_playground import registry
 
-from gpe.utils import acting
-from gpe.utils.buffer import RunningStatistics, UniformSamplingQueue
+from gpe.utils import acting, types
+from gpe.utils.buffer import RunningStatistics, TrajectorySamplingQueue
 from gpe.utils.logger import EpochLogger
 from gpe.utils.models import EnsembleValue, MHPolicy, get_tree_norm
 from gpe.utils.types import Transition
@@ -29,17 +29,19 @@ EPS = 1e-6
 default_cfg = {
     "log_freq": int(1e4),
     "save_freq": int(2e4),
-    "eval_episode_freq": 1,  # use saved bc_policy to run evaluatation
+    "eval_episode_freq": 5,  # use saved bc_policy to run evaluatation
     "hidden_size": 256,
     "max_grad_norm": 10.0,
     "gamma": 0.99,
     "update_tau": 0.005,
     "weight_decay": 0.01,
-    "update_per_step": 2,
+    "train_per_step": 2,
+    "policy_update_freq": 2,
+    "train_horizon": 10,
     "episode_length": 1000,
-    "warmup_samples": int(1e4),
-    "max_replay_size": int(1e6),
-    "total_iteration": int(1e6),
+    "warmup_samples": int(1e3),
+    "max_replay_size": int(6e5),
+    "total_iteration": int(5e5),
 }
 
 
@@ -59,13 +61,36 @@ def discounted_sum(arr, gamma):
     dtype = arr.dtype
     horizon = arr.shape[0]
 
-    def body_fun(t, cumsum):
+    def body_fun(cumsum, t):
         cumsum = arr[horizon - 1 - t] + gamma * cumsum
-        return cumsum
+        return (cumsum, cumsum)
 
     init_cumsum = jnp.zeros_like(arr[0], dtype=dtype)
-    cumsum = jax.lax.fori_loop(0, horizon, body_fun, init_cumsum)
-    return cumsum
+    cumsum, vec_cumsum = jax.lax.scan(body_fun, init_cumsum, jnp.arange(horizon))
+    return cumsum, jnp.flip(vec_cumsum, axis=0)
+
+
+def reshape_transition(data):
+    batch, horizon, num_env, obs_dim = data.observation.shape
+    batch, horizon, num_env, act_dim = data.action.shape
+
+    assert num_env == 1, f"number of env should be set to 1 not {num_env}"
+
+    # Batch X H X obs/act/()_dim
+    obs = data.observation.reshape(batch, horizon, obs_dim)
+    act = data.action.reshape(batch, horizon, act_dim)
+    next_obs = data.next_observation.reshape(batch, horizon, obs_dim)
+    reward = data.reward.reshape(batch, horizon)
+    discount = data.discount.reshape(batch, horizon)
+
+    return types.Transition(
+        observation=obs,
+        action=act,
+        next_observation=next_obs,
+        reward=reward,
+        discount=discount,
+        extras=data.extras,
+    )
 
 
 def prefill_buffer(
@@ -119,60 +144,65 @@ def get_experience(
     return env_state, buffer_state
 
 
+def compute_target_value(value, data, pi_act_seq, config):
+    gamma, lmbda = config.gamma, config.lmbda
+
+    # B X 1 X obs_dim
+    curr_obs = jnp.expand_dims(data.observation[:, 0], axis=1)
+    # B X H+1 X obs_dim
+    obs_seq = jnp.concatenate([curr_obs, data.next_observation], axis=1)
+
+    # B X H+1
+    v = jnp.minimum(*value(jnp.concatenate([obs_seq, pi_act_seq], axis=-1)))
+    # B X H
+    td = data.reward + gamma * data.discount * v[:, 1:] - v[:, :-1]
+    # H X B
+    _, adv_transpose = discounted_sum(td.T, gamma * lmbda)
+    # B X H
+    target_q = adv_transpose.T + v[:, :-1]
+    return target_q
+
+
 def value_loss_grad_fun(
     target_value_model,
     value_model,
-    policy_model,
     data,
-    gamma,
-    key,
+    pi_act_seq,
+    config,
 ):
-    batch, num_env, obs_dim = data.observation.shape
-    batch, num_env, act_dim = data.action.shape
-
-    # Batch X obs/act/()_dim
-    obs = data.observation.reshape(batch * num_env, obs_dim)
-    act = data.action.reshape(batch * num_env, act_dim)
-    next_obs = data.next_observation.reshape(batch * num_env, obs_dim)
-    reward = data.reward.reshape(batch * num_env)
-    discount = data.discount.reshape(batch * num_env)
-
-    # Batch X Horizon
-    next_act, _ = policy_model(next_obs, act, key)
-    # Batch
-    next_q = jnp.minimum(*target_value_model(jnp.concat([next_obs, next_act], axis=-1)))
-    target_v = reward + gamma * discount * next_q
+    # Batch X H
+    target_v = compute_target_value(target_value_model, data, pi_act_seq, config)
 
     def loss_fun(value_model):
         # Batch X Horizon X obs_act_dim
-        target_oa = jnp.concat([obs, act], axis=-1)
+        target_oa = jnp.concat([data.observation, data.action], axis=-1)
         # Batch X Horizon
         pred_v1, pred_v2 = value_model(target_oa)
         v1_loss = optax.huber_loss(pred_v1, target_v, delta=2.0)
         v2_loss = optax.huber_loss(pred_v2, target_v, delta=2.0)
         loss = jnp.mean(v1_loss) + jnp.mean(v2_loss)
-        return loss
+        # Batch
+        priority = 0.5 * (jnp.abs(pred_v1 - target_v) + jnp.abs(pred_v2 - target_v))
+        priority_loss = jnp.clip(priority[:, 0], max=1e4)
+        return loss, (priority_loss,)
 
-    grad_fun = nnx.value_and_grad(loss_fun)
-    loss, grads = grad_fun(value_model)
+    grad_fun = nnx.value_and_grad(loss_fun, has_aux=True)
+    (loss, aux_value), grads = grad_fun(value_model)
 
-    return loss, grads
+    return loss, grads, *aux_value
 
 
 def policy_loss_grad_fun(
     value_model,
     policy_model,
     data,
+    pi_act_seq,
     config,
-    key,
 ):
-    batch, num_env, obs_dim = data.observation.shape
-    batch, num_env, act_dim = data.action.shape
-
-    # Batch X obs/act/()_dim
-    obs = data.observation.reshape(batch * num_env, obs_dim)
-    act = data.action.reshape(batch * num_env, act_dim)
-    pi_act, _ = policy_model(obs, act, key)
+    # B X H X obs/act_dim
+    obs = data.observation
+    act = data.action
+    pi_act = pi_act_seq[:, :-1]
 
     q = jnp.minimum(*value_model(jnp.concat([obs, act], axis=-1)))
     v = jnp.minimum(*value_model(jnp.concat([obs, pi_act], axis=-1)))
@@ -182,7 +212,7 @@ def policy_loss_grad_fun(
         h = policy_model.h(obs, act)
         hpi = policy_model.h(obs, pi_act)
         pg_loss = -jnp.mean(adv * (h - hpi))
-        reg_loss = 0.5 * config.lmbda * jnp.mean(h**2 + hpi**2)
+        reg_loss = 0.5 * config.alpha * jnp.mean(h**2 + hpi**2)
         return pg_loss + reg_loss, (pg_loss, reg_loss)
 
     grad_fun = nnx.value_and_grad(loss_fun, has_aux=True)
@@ -197,29 +227,43 @@ def train_step(
     value_optimizer,
     policy_model,
     policy_optimizer,
-    batch_data,
+    data,
     config,
     key,
     steps,
 ):
-    value_key, policy_key = jax.random.split(key)
+    data = reshape_transition(data)
 
-    value_loss, value_grads = value_loss_grad_fun(
+    # B X 1 X obs_dim
+    curr_obs = jnp.expand_dims(data.observation[:, 0], axis=1)
+    curr_act = jnp.expand_dims(data.action[:, 0], axis=1)
+    # B X H+1 X obs/act_dim
+    obs_seq = jnp.concatenate([curr_obs, data.next_observation], axis=1)
+    init_act_seq = jnp.concatenate([curr_act, data.action], axis=1)
+
+    # B X H+1 X act_dim
+    pi_act_seq, _ = policy_model(obs_seq, init_act_seq, key)
+
+    value_loss, value_grads, *priority_aux = value_loss_grad_fun(
         target_value_model=value_model_target,
         value_model=value_model,
-        policy_model=policy_model,
-        data=batch_data,
-        gamma=config.gamma,
-        key=value_key,
+        data=data,
+        pi_act_seq=pi_act_seq,
+        config=config,
     )
     value_optimizer.update(value_grads)
 
     policy_loss, policy_grads, *policy_aux = policy_loss_grad_fun(
         value_model=value_model,
         policy_model=policy_model,
-        data=batch_data,
+        data=data,
+        pi_act_seq=pi_act_seq,
         config=config,
-        key=policy_key,
+    )
+    policy_cond = (steps % config.policy_update_freq) == 0
+    policy_grads = jax.tree.map(
+        lambda g: jnp.where(policy_cond, g, jnp.zeros_like(g)),
+        policy_grads,
     )
     policy_optimizer.update(policy_grads)
 
@@ -227,11 +271,7 @@ def train_step(
         value_model_target, value_model, config.update_tau
     )
 
-    return (
-        value_loss,
-        policy_loss,
-        *policy_aux,
-    )
+    return *priority_aux, (value_loss, policy_cond * policy_loss, *policy_aux)
 
 
 @functools.partial(nnx.jit, static_argnames=("env", "buffer"))
@@ -279,21 +319,22 @@ def train_n_steps(
                 value_optimizer,
             ) = models
 
-            buffer_state, batch_data = buffer.sample(buffer_state)
+            buffer_state, batch_data, idxs = buffer.sample(buffer_state)
 
             key, train_key = jax.random.split(key)
-            steps = config.update_per_step * i + j
-            val = train_step(
+            steps = config.train_per_step * i + j
+            priority, val = train_step(
                 value_model_target=value_model_target,
                 value_model=value_model,
                 value_optimizer=value_optimizer,
                 policy_model=policy_model,
                 policy_optimizer=policy_optimizer,
-                batch_data=batch_data,
+                data=batch_data,
                 config=config,
                 key=train_key,
                 steps=steps,
             )
+            buffer_state = buffer.update_priorities(buffer_state, idxs, priority)
 
             carry = (
                 key,
@@ -311,7 +352,7 @@ def train_n_steps(
             return carry
 
         init_carry = (key, (env_state, running_state), buffer_state, models, val)
-        carry = nnx.fori_loop(0, config.update_per_step, do_train, init_carry)
+        carry = nnx.fori_loop(1, config.train_per_step + 1, do_train, init_carry)
 
         return carry
 
@@ -356,6 +397,8 @@ def main(args, cfg_env=None):
     jax.default_device = jax.devices(args.device)[args.device_id]
 
     config = default_cfg
+    config["train_horizon"] = args.train_horizon
+    config["alpha"] = args.alpha
     config["beta"] = args.beta
     config["lmbda"] = args.lmbda
     config["decay"] = args.decay
@@ -376,6 +419,7 @@ def main(args, cfg_env=None):
     env = acting.wrap_env_for_training(
         env=registry.load(args.task),
         episode_length=config["episode_length"],
+        full_reset=True,
     )
     env_state = env.reset(env_key)
 
@@ -428,16 +472,19 @@ def main(args, cfg_env=None):
         extras={"state_extras": {"truncation": dummy_zero}},
     )
 
-    buffer = UniformSamplingQueue(
+    buffer = TrajectorySamplingQueue(
         max_replay_size=config["max_replay_size"],
         dummy_data_sample=dummy_transition,
         sample_batch_size=batch_size,
+        horizon=config["train_horizon"],
     )
     prng_key, buffer_key = jax.random.split(prng_key)
     buffer_state = buffer.init(buffer_key)
 
     prng_key, running_key = jax.random.split(prng_key)
-    running_state = RunningStatistics.init((config["episode_length"],), running_key)
+    running_state = RunningStatistics.init(
+        (config["eval_episode_freq"] * config["episode_length"],), running_key
+    )
 
     # set logger
     dict_args = config
@@ -495,32 +542,36 @@ def main(args, cfg_env=None):
 
         logger.logged = False
 
-        if (steps % config["log_freq"] == 0) and (not logger.logged):
-            logger.log_tabular("Train/Steps", steps)
+        logger.log_tabular("Train/Steps", steps)
 
-            logger.log_tabular("Loss/Loss_value", value_loss.item())
+        logger.log_tabular("Loss/Loss_value", value_loss.item())
 
-            logger.log_tabular("Loss/Loss_policy", policy_loss.item())
-            logger.log_tabular("Loss/Loss_policy_pg", policy_pg_loss.item())
-            logger.log_tabular("Loss/Loss_policy_reg", policy_reg_loss.item())
+        logger.log_tabular("Loss/Loss_policy", policy_loss.item())
+        logger.log_tabular("Loss/Loss_policy_pg", policy_pg_loss.item())
+        logger.log_tabular("Loss/Loss_policy_reg", policy_reg_loss.item())
 
-            logger.log_tabular("Loss/policy_q_value", policy_qmean.item())
-            logger.log_tabular("Loss/policy_v_value", policy_vmean.item())
+        logger.log_tabular("Loss/policy_q_value", policy_qmean.item())
+        logger.log_tabular("Loss/policy_v_value", policy_vmean.item())
 
-            logger.log_tabular(
-                "Norm/value_model",
-                get_tree_norm(nnx.state(value_model, nnx.Param)),
-            )
-            logger.log_tabular(
-                "Norm/policy_model",
-                get_tree_norm(nnx.state(policy_model, nnx.Param)),
-            )
+        logger.log_tabular("Buffer/max_priority", buffer_state.max_priority)
 
-            logger.log_tabular("Eval/Return", running_state.reward_state.data.sum())
+        logger.log_tabular(
+            "Norm/value_model",
+            get_tree_norm(nnx.state(value_model, nnx.Param)),
+        )
+        logger.log_tabular(
+            "Norm/policy_model",
+            get_tree_norm(nnx.state(policy_model, nnx.Param)),
+        )
 
-            logger.dump_tabular()
+        logger.log_tabular(
+            "Eval/Return",
+            running_state.reward_state.data.sum() / config["eval_episode_freq"],
+        )
 
-        if steps % config["save_freq"] == 0:
+        logger.dump_tabular()
+
+        if (steps - config["warmup_samples"]) % config["save_freq"] == 0:
             logger.nn_model_save(
                 itr=steps,
                 nn_model_saver_element=value_model,

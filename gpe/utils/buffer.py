@@ -26,6 +26,11 @@ State = TypeVar("State")
 Sample = TypeVar("Sample")
 
 
+@jax.jit
+def update_arr_jit(arr, idxs, val):
+    return arr.at[idxs].set(val)
+
+
 class ReplayBuffer(abc.ABC, Generic[State, Sample]):
     """Contains replay buffer methods."""
 
@@ -200,6 +205,165 @@ class UniformSamplingQueue(QueueBase[Sample], Generic[Sample]):
         )
         batch = jnp.take(buffer_state.data, idx, axis=0, mode="wrap")
         return buffer_state.replace(key=key), self._unflatten_fn(batch)
+
+
+@flax.struct.dataclass
+class ReplayBufferTrajState(ReplayBufferState):
+    curr_traj_len: int
+    mask: jnp.ndarray
+    max_priority: float
+
+
+class TrajectorySamplingQueue(QueueBase[Sample], Generic[Sample]):
+    def __init__(
+        self,
+        max_replay_size: int,
+        dummy_data_sample: Sample,
+        horizon: int,
+        sample_batch_size: int,
+        priority_alpha: float = 0.6,  # TD-MPC value
+    ):
+        super().__init__(max_replay_size, dummy_data_sample, sample_batch_size)
+        self._horizon = horizon
+        self._priority_alpha = priority_alpha
+        self._max_replay_size = max_replay_size
+        # unflatten_fn for batch and horizon sample
+        self._unflatten_fn = jax.vmap(self._unflatten_fn)
+
+    def init(self, key: PRNGKey) -> ReplayBufferTrajState:
+        return ReplayBufferTrajState(
+            data=jnp.zeros(self._data_shape, self._data_dtype),
+            mask=jnp.zeros(self._max_replay_size, self._data_dtype),
+            sample_position=jnp.zeros((), jnp.int32),
+            insert_position=jnp.zeros((), jnp.int32),
+            curr_traj_len=jnp.zeros((), jnp.int32),
+            max_priority=1.0,
+            key=key,
+        )
+
+    def insert_internal(
+        self,
+        buffer_state: ReplayBufferTrajState,
+        samples: Sample,
+    ) -> ReplayBufferTrajState:
+        """
+        Insert data in the replay buffer one transition at a time.
+        """
+
+        if buffer_state.data.shape != self._data_shape:
+            raise ValueError(
+                f"buffer_state.data.shape ({buffer_state.data.shape}) "
+                f"doesn't match the expected value ({self._data_shape})"
+            )
+
+        # samples is of type types.Transition
+        discount = samples.discount
+
+        update = self._flatten_fn(samples)
+
+        if len(update) != 1 or len(discount) != 1:
+            raise ValueError(
+                f"number of transitions ({len(update)}) "
+                f"more than one transition passed."
+            )
+
+        horizon = self._horizon
+        curr_traj_len = buffer_state.curr_traj_len
+
+        data = buffer_state.data
+        mask = buffer_state.mask
+
+        # If needed, roll the buffer to make sure there's enough space to fit
+        # `update` after the current position.
+        position = buffer_state.insert_position
+        roll = jnp.minimum(0, len(data) - position - len(update))
+        data = jax.lax.cond(roll, lambda: jnp.roll(data, roll, axis=0), lambda: data)
+        mask = jax.lax.cond(roll, lambda: jnp.roll(mask, roll, axis=0), lambda: mask)
+
+        position = position + roll
+
+        mask_start_pos = position + len(update) - 1
+        # end = start - (horizon - 1)
+        mask_end_pos = jnp.maximum(0, mask_start_pos - horizon + 1)
+
+        # Update buffer data
+        data = jax.lax.dynamic_update_slice_in_dim(data, update, position, axis=0)
+
+        # Update buffer mask
+        max_priority = jnp.maximum(1.0, mask.max())
+        select_mask, dselect_mask = jnp.array((max_priority,)), jnp.array((0.0,))
+        mask = jax.lax.dynamic_update_slice_in_dim(
+            mask, dselect_mask, mask_start_pos, axis=0
+        )
+        mask = jax.lax.dynamic_update_slice_in_dim(
+            mask,
+            jnp.where(curr_traj_len + 1 >= horizon, select_mask, dselect_mask),
+            mask_end_pos,
+            axis=0,
+        )
+
+        # Update the control numbers.
+        curr_traj_len = jnp.where(discount.sum(), curr_traj_len + 1, 0)
+        position = (position + len(update)) % (len(data) + 1)
+        sample_position = jnp.maximum(0, buffer_state.sample_position + roll)
+
+        return buffer_state.replace(
+            data=data,
+            mask=mask,
+            max_priority=max_priority,
+            curr_traj_len=curr_traj_len,
+            insert_position=position,
+            sample_position=sample_position,
+        )
+
+    def update_priorities(
+        self,
+        buffer_state: ReplayBufferTrajState,
+        idxs: jnp.ndarray,
+        priorities: jnp.ndarray,
+    ):
+        # idxs: Batch
+        # priorities: Batch
+        assert (
+            idxs.shape[0] == priorities.shape[0] == self._sample_batch_size
+        ), "update priorities shape doesnot match"
+
+        mask = buffer_state.mask
+        mask = update_arr_jit(mask, idxs, priorities)
+        return buffer_state.replace(mask=mask)
+
+    def sample_internal(
+        self, buffer_state: ReplayBufferTrajState
+    ) -> Tuple[ReplayBufferTrajState, Sample]:
+        if buffer_state.data.shape != self._data_shape:
+            raise ValueError(
+                f"Data shape expected by the replay buffer ({self._data_shape}) does "
+                f"not match the shape of the buffer state ({buffer_state.data.shape})"
+            )
+
+        key, sample_key = jax.random.split(buffer_state.key)
+
+        data = buffer_state.data
+        mask = buffer_state.mask
+
+        probs = mask**self._priority_alpha
+        probs /= probs.sum()
+        # Batch
+        idxs = jax.random.choice(
+            key=sample_key,
+            a=len(mask),
+            shape=(self._sample_batch_size,),
+            p=probs,
+            replace=False,
+        )
+
+        horizon_offsets = jnp.arange(self._horizon)
+        # Batch X horizon
+        offset_idxs = idxs[:, None] + horizon_offsets
+        # Batch X horizon X sample_dim
+        batch = data[offset_idxs]
+
+        return buffer_state.replace(key=key), self._unflatten_fn(batch), idxs
 
 
 @flax.struct.dataclass

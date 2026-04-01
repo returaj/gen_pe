@@ -91,13 +91,13 @@ def single_agent_args():
         {
             "name": "--batch-size",
             "type": int,
-            "default": 128,
+            "default": 256,
             "help": "The number of steps to run in each environment per policy rollout",
         },
         {
             "name": "--lr",
             "type": float,
-            "default": 1e-5,  # 1e-3 performs better
+            "default": 3e-4,
             "help": "Default common learning rate for the models",
         },
         {
@@ -113,21 +113,27 @@ def single_agent_args():
             "help": "To normalize the state observation.",
         },
         {
+            "name": "--train-horizon",
+            "type": int,
+            "default": 10,
+            "help": "The horizon length used for training the models",
+        },
+        {
             "name": "--lmbda",
             "type": float,
-            "default": None,
+            "default": 0.9,
             "help": "hyperparameter lmbda value",
         },
         {
             "name": "--alpha",
             "type": float,
-            "default": None,
+            "default": 0.1,
             "help": "hyperparameter alpha value",
         },
         {
             "name": "--beta",
             "type": float,
-            "default": 1.0,
+            "default": 0.6,
             "help": "hyperparameter beta value",
         },
         {
