@@ -17,6 +17,7 @@ from typing import Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
+from brax.envs.wrappers import training as brax_training
 from mujoco_playground import wrapper
 
 from gpe.utils import types
@@ -46,11 +47,14 @@ class WrapPrevAction(wrapper.Wrapper):
         return nstate
 
 
-def wrap_env_for_training(env, episode_length, action_repeat=1):
-    env = wrapper.wrap_for_brax_training(
-        env=env, episode_length=episode_length, action_repeat=action_repeat
-    )
-    return WrapPrevAction(env)
+def wrap_env_for_training(env, episode_length, action_repeat=1, full_reset=False):
+    # Please see wrapper.wrap_for_brax_training() method. 
+    # Since we need previous action in our state.info we have to do it individually. 
+    env = brax_training.VmapWrapper(env)
+    env = brax_training.EpisodeWrapper(env, episode_length, action_repeat)
+    env = WrapPrevAction(env)
+    env = wrapper.BraxAutoResetWrapper(env, full_reset=full_reset)
+    return env
 
 
 def actor_step(
