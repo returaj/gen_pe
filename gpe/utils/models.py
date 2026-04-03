@@ -176,7 +176,7 @@ class MHPolicy(PreferencePolicy):
         (u, sigma, key) = nnx.fori_loop(0, self.num_itr, body, init_carry)
 
         # h: B X H X (num_particles + 1)
-        logits = self.h(obs, u)
+        logits = self.h(obs, u) / self.beta
 
         # # idx: B X H
         # idx = jnp.argmax(logits, axis=-1)
