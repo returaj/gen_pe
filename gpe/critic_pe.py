@@ -463,7 +463,7 @@ def main(args, cfg_env=None):
         num_itr=config["warmup_samples"],
     )
 
-    logger.log("Start training value and policy model")
+    logger.log("Start training policy model")
     steps = buffer.size(buffer_state)
     while steps < config["total_iteration"]:
         prng_key, subkey = jax.random.split(prng_key)
