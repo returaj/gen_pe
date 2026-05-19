@@ -80,21 +80,18 @@ class EnsembleValue(nnx.Module):
 class PreferencePolicy(nnx.Module):
     def __init__(
         self,
-        rngs,
         obs_dim,
         act_dim,
         beta=1.0,
-        hidden_size=256,
         clip_range=(-0.9, 0.9),
     ):
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.beta = beta
         self.clip_range = clip_range
-        self._pref_model = TdmpcValue(rngs, obs_dim + act_dim, hidden_size)
 
     def h(self, obs, act):
-        return self._pref_model(jnp.concatenate([obs, act], axis=-1))
+        raise Exception("Please implement preference value.")        
 
     def sampling(self, obs, init_act, key, **kwargs):
         raise Exception("Please implement sampling strategy.")
@@ -106,22 +103,26 @@ class PreferencePolicy(nnx.Module):
 class MHPolicy(PreferencePolicy):
     def __init__(
         self,
-        rngs,
         obs_dim,
         act_dim,
         beta=1.0,
-        hidden_size=256,
         clip_range=(-0.9, 0.9),
         sigma=1.0,
         decay=0.9,
         num_itr=10,
         num_particles=5,
+        pref_model=None,
     ):
-        super().__init__(rngs, obs_dim, act_dim, beta, hidden_size, clip_range)
+        super().__init__(obs_dim, act_dim, beta, clip_range)
         self.sigma = sigma
         self.decay = decay
         self.num_itr = num_itr
         self.num_particles = num_particles
+
+        self._pref_model = pref_model
+        
+    def h(self, obs, act):
+        return self._pref_model(jnp.concatenate([obs, act], axis=-1))
 
     def mh_sampling(self, obs, init_act, key):
         # obs:  B X H X obs_dim
@@ -192,3 +193,8 @@ class MHPolicy(PreferencePolicy):
 
     def sampling(self, obs, init_act, key, **kwargs):
         return self.mh_sampling(obs, init_act, key, **kwargs)
+
+
+class CriticPolicy(MHPolicy):
+    def h(self, obs, act):
+        return jnp.minimum(*super().h(obs, act))

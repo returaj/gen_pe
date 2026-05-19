@@ -19,7 +19,7 @@ from mujoco_playground import registry
 from gpe.utils import acting, types
 from gpe.utils.buffer import RunningStatistics, TrajectorySamplingQueue
 from gpe.utils.logger import EpochLogger
-from gpe.utils.models import EnsembleValue, MHPolicy, get_tree_norm
+from gpe.utils.models import EnsembleValue, TdmpcValue, MHPolicy, get_tree_norm
 from gpe.utils.types import Transition
 from gpe.utils.utils import make_static_config_from_dict, single_agent_args
 
@@ -427,14 +427,18 @@ def main(args, cfg_env=None):
 
     # set model
     obs_dim, act_dim = env.observation_size, env.action_size
-    policy_model = MHPolicy(
+    pref_model = TdmpcValue(
         rngs=rngs,
+        x_dim=obs_dim+act_dim,
+        hidden_size=config["hidden_size"],
+    )
+    policy_model = MHPolicy(
         obs_dim=obs_dim,
         act_dim=act_dim,
         beta=config["beta"],
-        hidden_size=config["hidden_size"],
         decay=config["decay"],
         num_itr=config["num_integral_steps"],
+        pref_model=pref_model,
     )
     policy_optimizer = nnx.Optimizer(
         model=policy_model,
