@@ -19,7 +19,7 @@ from mujoco_playground import registry
 from gpe.utils import acting, types
 from gpe.utils.buffer import RunningStatistics, TrajectorySamplingQueue
 from gpe.utils.logger import EpochLogger
-from gpe.utils.models import EnsembleValue, MHPolicy, get_tree_norm
+from gpe.utils.models import EnsembleValue, CriticPolicy, get_tree_norm
 from gpe.utils.types import Transition
 from gpe.utils.utils import make_static_config_from_dict, single_agent_args
 
@@ -409,7 +409,7 @@ def main(args, cfg_env=None):
     )
     value_model_target = deepcopy(value_model)
 
-    policy_model = MHPolicy(
+    policy_model = CriticPolicy(
         obs_dim=obs_dim,
         act_dim=act_dim,
         beta=config["beta"],
