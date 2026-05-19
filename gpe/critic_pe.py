@@ -50,6 +50,7 @@ class ValueAux:
     loss: float = 0.0
     pg_loss: float = 0.0
     td_loss: float = 0.0
+    q: float = 0.0
 
 
 def polyak_update(target_model, curr_model, tau):
@@ -185,23 +186,26 @@ def value_grad_aux_fun(
         target_oa = jnp.concat([data.observation, data.action], axis=-1)
         # Batch X Horizon
         pred_q1, pred_q2 = value_model(target_oa)
+        
         # td loss
         q1_loss = optax.huber_loss(pred_q1, target_q, delta=2.0)
         q2_loss = optax.huber_loss(pred_q2, target_q, delta=2.0)
         td_loss = jnp.mean(q1_loss) + jnp.mean(q2_loss)
         # policy gradient
-        pg1_loss = (pred_q1 * (adv / config.beta + 1))
-        pg2_loss = (pred_q2 * (adv / config.beta + 1))
+        pg1_loss = -(pred_q1 * (adv / config.beta + 1))
+        pg2_loss = -(pred_q2 * (adv / config.beta + 1))
         pg_loss = jnp.mean(pg1_loss) + jnp.mean(pg2_loss)
         
         loss = td_loss + config.alpha * pg_loss
+        
+        q = jnp.minimum(pred_q1.mean(), pred_q2.mean())
 
         # Batch
         priority_q1 = jnp.abs(pred_q1 - target_q)[:, 0] 
         priority_q2 = jnp.abs(pred_q2 - target_q)[:, 0]
         # Batch
         priority = jnp.clip(jnp.maximum(priority_q1, priority_q2), min=1.0, max=1e4)
-        return loss, (priority, ValueAux(loss=loss, td_loss=td_loss, pg_loss=pg_loss))
+        return loss, (priority, ValueAux(loss=loss, td_loss=td_loss, pg_loss=pg_loss, q=q))
 
     grad_fun = nnx.value_and_grad(loss_fun, has_aux=True)
     (loss, aux_value), grads = grad_fun(value_model)
@@ -491,6 +495,8 @@ def main(args, cfg_env=None):
         logger.log_tabular("Loss/value", value_aux.loss.item())
         logger.log_tabular("Loss/pg", value_aux.pg_loss.item())
         logger.log_tabular("Loss/td", value_aux.td_loss.item())
+        logger.log_tabular("Loss/q", value_aux.q.item())
+
 
 
         logger.log_tabular("Buffer/max_priority", buffer_state.max_priority)
