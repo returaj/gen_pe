@@ -182,9 +182,11 @@ def value_loss_grad_fun(
         v2_loss = optax.huber_loss(pred_v2, target_v, delta=2.0)
         loss = jnp.mean(v1_loss) + jnp.mean(v2_loss)
         # Batch
-        priority = 0.5 * (jnp.abs(pred_v1 - target_v) + jnp.abs(pred_v2 - target_v))
-        priority_loss = jnp.clip(priority[:, 0], max=1e4)
-        return loss, (priority_loss,)
+        priority_v1 = jnp.abs(pred_v1 - target_v)[:, 0] 
+        priority_v2 = jnp.abs(pred_v2 - target_v)[:, 0]
+        # Batch
+        priority = jnp.clip(jnp.maximum(priority_v1, priority_v2), min=1.0, max=1e4)
+        return loss, (priority,)
 
     grad_fun = nnx.value_and_grad(loss_fun, has_aux=True)
     (loss, aux_value), grads = grad_fun(value_model)

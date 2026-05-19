@@ -173,16 +173,20 @@ class MHPolicy(PreferencePolicy):
 
         init_carry = (u, sigma, key)
         # u: B X H X (num_particles + 1) X act_dim
-        (u, sigma, _) = nnx.fori_loop(0, self.num_itr, body, init_carry)
+        (u, sigma, key) = nnx.fori_loop(0, self.num_itr, body, init_carry)
 
         # h: B X H X (num_particles + 1)
-        # max_idx: B X H
-        max_idx = jnp.argmax(self.h(obs, u), axis=-1)
+        logits = self.h(obs, u) / self.beta
+
+        # # idx: B X H
+        # idx = jnp.argmax(logits, axis=-1)
+        idx = jax.random.categorical(key, logits, axis=-1)
+
         # u: B X H X act_dim
         u = u[
             jnp.arange(batch)[:, None],  # B X 1
             jnp.arange(horizon)[None, :],  # 1 X H
-            max_idx,
+            idx,
         ]
         return u, sigma
 
